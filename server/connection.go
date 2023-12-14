@@ -1,33 +1,60 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/philpearl/bqupload/bigquery"
+	"github.com/philpearl/bqupload/protocol"
+	"github.com/philpearl/plenc"
 )
 
 type conn struct {
 	net.Conn
+	makeUploader bigquery.UploaderFactory
 }
 
-func newConn(c net.Conn) conn {
-	return conn{c}
+func newConn(c net.Conn, makeUploader bigquery.UploaderFactory) conn {
+	return conn{Conn: c, makeUploader: makeUploader}
 }
 
-func (c *conn) do() error {
+func (c *conn) do(ctx context.Context) error {
 	// First we read the stream descriptor. This contains the target table and the
 	// protobuf schema descriptor.
+	var lengthBuf [4]byte
+	if _, err := io.ReadFull(c, lengthBuf[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("reading message length: %w", err)
+	}
+	length := binary.BigEndian.Uint32(lengthBuf[:])
 
-	// Then we create a new stream to upload the data to BigQuery.
+	data := make([]byte, length)
+	if _, err := io.ReadFull(c, data); err != nil {
+		return fmt.Errorf("reading descriptor: %w", err)
+	}
+	var desc protocol.ConnectionDescriptor
+	if err := plenc.Unmarshal(data, &desc); err != nil {
+		return fmt.Errorf("unmarshalling descriptor: %w", err)
+	}
 
-	var u upload
+	// Here's where we create the stream we're using for uploading
+	u, err := c.makeUploader(ctx, &desc)
+	if err != nil {
+		return fmt.Errorf("creating uploader: %w", err)
+	}
+
+	// TODO: if there's no traffic for a while we want to be able to push what
+	// we have in hand. Perhaps some deadlines on the reads?
 
 	// Then we read the data from the stream. We acknowledge each message as we
 	// receive it.
-	var lengthBuf [4]byte
-	for i := uint32(0); ; i++ {
+	for i := uint32(1); ; i++ {
 		// Read the message length. Then we read the message directly into the
 		// upload buffer. We use fixed size 4 byte lengths for ease of use.
 		if _, err := io.ReadFull(c, lengthBuf[:]); err != nil {
@@ -37,12 +64,12 @@ func (c *conn) do() error {
 			return fmt.Errorf("reading message length: %w", err)
 		}
 		length := binary.BigEndian.Uint32(lengthBuf[:])
-		data := u.bufferFor(int(length))
+		data := u.BufferFor(int(length))
 
 		if _, err := io.ReadFull(c, data); err != nil {
 			return fmt.Errorf("reading message: %w", err)
 		}
-		u.add(data)
+		u.Add(data)
 
 		// Acknowledge the message. We'll just send the message number since we
 		// always process them in order. The sender can just wait until the

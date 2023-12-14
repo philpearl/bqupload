@@ -6,15 +6,21 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+
+	"github.com/philpearl/bqupload/bigquery"
+	"golang.org/x/sync/errgroup"
 )
 
 type Server struct {
-	addr string
-	log  *slog.Logger
+	addr         string
+	log          *slog.Logger
+	listener     net.Listener
+	eg           errgroup.Group
+	makeUploader bigquery.UploaderFactory
 }
 
-func New(addr string, log *slog.Logger) *Server {
-	return &Server{addr: addr, log: log}
+func New(addr string, log *slog.Logger, makeUploader bigquery.UploaderFactory) *Server {
+	return &Server{addr: addr, log: log, makeUploader: makeUploader}
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -24,25 +30,39 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", s.addr, err)
 	}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
+	s.listener = ln
+
+	s.eg.Go(func() error {
+		for {
+			conn, err := s.listener.Accept()
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+					return nil
+				}
+				return fmt.Errorf("accepting connection: %w", err)
 			}
-			return fmt.Errorf("accepting connection: %w", err)
+			s.log.LogAttrs(context.Background(), slog.LevelInfo, "new connection", slog.Any("remote", conn.RemoteAddr()))
+			go s.onNewConnection(ctx, conn)
 		}
-		go s.onNewConnection(conn)
+	})
+	return nil
+}
+
+func (s *Server) Addr() net.Addr {
+	return s.listener.Addr()
+}
+
+func (s *Server) Stop() error {
+	if err := s.listener.Close(); err != nil {
+		return fmt.Errorf("closing listener: %w", err)
 	}
+	return s.eg.Wait()
 }
 
-func (s *Server) Stop() {
-}
-
-func (s *Server) onNewConnection(conn net.Conn) {
+func (s *Server) onNewConnection(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	c := newConn(conn)
-	if err := c.do(); err != nil {
-		s.log.LogAttrs(context.Background(), slog.LevelError, "connection error", slog.Any("error", err))
+	c := newConn(conn, s.makeUploader)
+	if err := c.do(ctx); err != nil {
+		s.log.LogAttrs(ctx, slog.LevelError, "connection error", slog.Any("error", err))
 	}
 }

@@ -1,202 +1,216 @@
 package client
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
+	"time"
 
+	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/plenc"
 )
 
 type Client struct {
-	p    *plenc.Plenc
-	pool pool
+	pool            pool
+	host            string
+	port            string
+	dnsCacheTimeout time.Duration
+	desc            []byte
 }
 
-func New(addr string) *Client {
-	return &Client{}
-}
+func New(addr string, pl *plenc.Plenc, desc *protocol.ConnectionDescriptor) (*Client, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("splitting host and port: %w", err)
+	}
 
-func (c *Client) Start() error {
-	return nil
+	data, err := pl.Marshal(nil, desc)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling descriptor: %w", err)
+	}
+
+	c := &Client{
+		host:            host,
+		port:            port,
+		dnsCacheTimeout: time.Second * 10,
+		pool: pool{
+			p: pl,
+		},
+		desc: data,
+	}
+	c.pool.c = c
+
+	return c, nil
 }
 
 func (c *Client) Stop() {}
 
-func (c *Client) Publish(v *any) error {
+func (c *Client) Publish(ctx context.Context, v any) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Millisecond*100)
+	defer cancel()
 	// grab a connection from the pool
-	conn, err := c.pool.get()
+	conn, err := c.pool.get(ctx)
 	if err != nil {
 		return fmt.Errorf("getting connection: %w", err)
 	}
 
 	// Send the data. The connection returns itself to the pool
-	return conn.publish(v)
+	return conn.publish(ctx, v)
 }
 
+// pool manages a pool of connections.
+//
+// We potentially want to have multiple
+// connections to the same server, but we certainly want a set of connections to
+// different servers
 type pool struct {
-	p *plenc.Plenc
+	mu       sync.Mutex
+	p        *plenc.Plenc
+	resolver net.Resolver
+	c        *Client
+
+	// The hosts we're sending to. next is the index of the next host to use.
+	// This is a slice of pointers so we can remove hosts from the list while
+	// another thread is reading/writing the host pool entry.
+	hosts []*hostPool
+	next  int
+
+	// lastLookup is the time we last looked up the host list
+	lastLookup time.Time
 }
 
-func (p *pool) get() (*connection, error) {
-	// Only one goroutine can get a particular connection at a time
+type hostPool struct {
+	pool        *pool
+	name        string
+	addr        string
+	connections []*connection
+}
 
-	c, err := p.newConnection(context.Background(), "localhost:1234")
+func (hp *hostPool) get(ctx context.Context) (*connection, error) {
+	// We expect the pool lock to be held when this function is called.
+
+	// Do we have an existing entry we can use?
+	for _, c := range hp.connections {
+		if c.inUse {
+			continue
+		}
+		c.inUse = true
+		return c, nil
+	}
+
+	// TODO: if the connection list is already big enough, we should wait for
+	// one to become free. How!?
+
+	c, err := hp.newConnection(ctx, hp.addr)
 	if err != nil {
 		return nil, fmt.Errorf("creating connection: %w", err)
 	}
 
+	c.inUse = true
+	hp.connections = append(hp.connections, c)
+
 	return c, nil
 }
 
-func (p *pool) release(c *connection) {
+func (hp *hostPool) release(c *connection) {
 	// This goroutine has exclusive write-side access to the connection at this
-	// point.
+	// point. We don't expect the pool lock or the connection lock to be held.
 	if c.count > 100_000 {
-		// TODO: drop this connection! Don't then return it to the pool
+		// drop this connection! Don't then return it to the pool
+		c.terminate(nil)
 	}
+
+	hp.pool.mu.Lock()
+	defer hp.pool.mu.Unlock()
+	if c.terminated || c.err != nil {
+		// Remove this connection from the list of ones to consider.
+		keep := hp.connections[:0]
+		for _, conn := range hp.connections {
+			if c != conn {
+				keep = append(keep, conn)
+			}
+		}
+		hp.connections = keep
+	}
+	c.inUse = false
 }
 
-type connection struct {
-	pool *pool
+func (p *pool) get(ctx context.Context) (*connection, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Only one goroutine can own a particular connection for writing at a time.
+	// So when this function returns the calling goroutine has exclusive access to the
+	// write-side parts of the connection
 
-	sendBuf []byte
-	conn    *net.TCPConn
+	if err := p.ensureHostList(ctx); err != nil {
+		return nil, fmt.Errorf("ensuring host list: %w", err)
+	}
 
-	cond       sync.Cond
-	m          sync.Mutex
-	wg         sync.WaitGroup
-	err        error
-	terminated bool
+	if len(p.hosts) == 0 {
+		return nil, fmt.Errorf("no hosts")
+	}
 
-	count uint32
-	acked uint32
-}
+	if p.next >= len(p.hosts) {
+		p.next = 0
+	}
 
-func (p *pool) newConnection(ctx context.Context, addr string) (*connection, error) {
-	// Looks like a dialer is the modern way to do this
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	c, err := p.hosts[p.next].get(ctx)
+	p.next++
 	if err != nil {
-		return nil, fmt.Errorf("dialing: %w", err)
+		return nil, fmt.Errorf("getting connection: %w", err)
 	}
 
-	c := &connection{
-		pool: p,
-		conn: conn.(*net.TCPConn),
-	}
-	c.cond.L = &c.m
-
-	// TODO: need to send the descriptor at the start of each connection
-
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		err := c.readLoop()
-		c.terminate(err)
-	}()
 	return c, nil
 }
 
-func (c *connection) close() error {
-	c.terminate(nil)
-	c.wg.Wait()
-	return c.err
-}
+func (p *pool) ensureHostList(ctx context.Context) error {
+	if time.Since(p.lastLookup) < p.c.dnsCacheTimeout {
+		return nil
+	}
 
-func (c *connection) publish(v any) error {
-	// We have exclusive write-side access to this connection.
-	// We send a 4 byte length followed by the data.
-	c.sendBuf = append(c.sendBuf[:0], 0, 0, 0, 0)
-	var err error
-	c.sendBuf, err = c.pool.p.Marshal(c.sendBuf, v)
+	// TODO: should do this in the background once we have an initial host list
+
+	addrs, err := p.resolver.LookupHost(ctx, p.c.host)
 	if err != nil {
-		return fmt.Errorf("marshalling: %w", err)
+		return fmt.Errorf("looking up host: %w", err)
 	}
 
-	binary.BigEndian.PutUint32(c.sendBuf, uint32(len(c.sendBuf)-4))
-	if _, err := c.conn.Write(c.sendBuf); err != nil {
-		err = fmt.Errorf("writing: %w", err)
-		c.terminate(err)
-		return err
-	}
+	// Remove any hosts that are no longer in the list.
+	keep := p.hosts[:0]
+	for _, h := range p.hosts {
 
-	c.count++
-	seqNo := c.count
-	// TODO: close the connection if the count gets too big
-
-	// At this point we can release the connection back to the pool. From this
-	// point forward we don't have exclusive write-side access to the
-	// connection.
-	c.pool.release(c)
-
-	return c.waitFor(seqNo)
-}
-
-func (c *connection) waitFor(seqNo uint32) error {
-	c.m.Lock()
-	defer c.m.Unlock()
-	// TODO: also check for errors / closure
-
-	for c.acked < seqNo && c.err == nil {
-		c.cond.Wait()
-	}
-
-	return c.err
-}
-
-func (c *connection) ack(seqNo uint32) {
-	c.m.Lock()
-	defer c.m.Unlock()
-
-	if c.acked < seqNo {
-		c.acked = seqNo
-		c.cond.Broadcast()
-	}
-}
-
-func (c *connection) terminate(err error) {
-	c.m.Lock()
-	defer c.m.Unlock()
-
-	// We close the write-side of the connection to signal to the server that it
-	// should close the read-side. We don't close the read-side here as we want
-	// to read any data that the server sends back to us.
-	if cerr := c.conn.CloseWrite(); cerr != nil && err == nil {
-		err = fmt.Errorf("closing: %w", cerr)
-	}
-	if c.err == nil {
-		c.err = err
-	}
-	c.terminated = true
-	c.cond.Broadcast()
-}
-
-func (c *connection) readLoop() error {
-	// All we ever receive back from the server is a sequence of 4 byte numbers.
-	// And they increase by 1 each time! Could perhaps optimise this!
-	var buf [4]byte
-	r := bufio.NewReader(c.conn)
-	for {
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return fmt.Errorf("reading length: %w", err)
-		}
-
-		// We don't need to actually process every number received, so if there's data buffered we can skip ahead
-		for i := 0; r.Buffered() > 4 && i < 100; i++ {
-			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return fmt.Errorf("reading length: %w", err)
+		var found bool
+		for _, addr := range addrs {
+			if h.name == addr {
+				found = true
+				break
 			}
 		}
-		ack := binary.BigEndian.Uint32(buf[:])
-		c.ack(ack)
+		if found {
+			// keep this host
+			keep = append(keep, h)
+		}
 	}
+	p.hosts = keep
+
+	for _, addr := range addrs {
+		var found bool
+		for _, h := range p.hosts {
+			if h.name == addr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// add this host
+			p.hosts = append(p.hosts, &hostPool{
+				name: addr,
+				addr: net.JoinHostPort(addr, p.c.port),
+				pool: p,
+			})
+		}
+	}
+
+	return nil
 }

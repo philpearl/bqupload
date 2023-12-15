@@ -2,6 +2,7 @@ package bigquery
 
 import (
 	"context"
+	"sync"
 
 	"github.com/philpearl/bqupload/protocol"
 )
@@ -35,6 +36,7 @@ type uploadBuffer struct {
 type upload struct {
 	currentBuffer uploadBuffer
 	ch            chan<- uploadBuffer
+	wg            sync.WaitGroup
 }
 
 // BufferFor returns a buffer of exactly size bytes. If the current uploadBuffer
@@ -62,4 +64,10 @@ func (u *upload) send() {
 		return
 	}
 	u.ch <- u.currentBuffer
+}
+
+func (u *upload) Wait() {
+	u.send()
+	close(u.ch)
+	u.wg.Wait()
 }

@@ -39,13 +39,16 @@ func (bq *bq) MakeUploader(ctx context.Context, desc *protocol.ConnectionDescrip
 	}
 
 	ch := make(chan (uploadBuffer), 10)
+	u := &upload{ch: ch}
 
 	bu := newBqUpload(ms, ch, bq.log)
+	u.wg.Add(1)
 	go func() {
+		defer u.wg.Done()
 		bu.run(ctx)
 	}()
 
-	return &upload{ch: ch}, nil
+	return u, nil
 }
 
 type bqUload struct {

@@ -4,8 +4,10 @@ go 1.21.4
 
 require (
 	cloud.google.com/go/bigquery v1.57.1
+	github.com/google/go-cmp v0.6.0
 	github.com/philpearl/plenc v0.0.12
 	golang.org/x/sync v0.5.0
+	google.golang.org/protobuf v1.31.0
 )
 
 require (
@@ -30,5 +32,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20231016165738-49dd2c1f3d0b // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20231016165738-49dd2c1f3d0b // indirect
 	google.golang.org/grpc v1.59.0 // indirect
-	google.golang.org/protobuf v1.31.0 // indirect
 )

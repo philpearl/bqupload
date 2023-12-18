@@ -10,6 +10,8 @@ import (
 const (
 	maxUploadBytes = 10 * 1024 * 1024
 	maxUploadCount = 10_000
+
+	minUploadCount = 5
 )
 
 type Uploader interface {
@@ -27,6 +29,7 @@ type UploaderFactory func(ctx context.Context, desc *protocol.ConnectionDescript
 type uploadBuffer struct {
 	buf  []byte
 	Data [][]byte
+	desc *protocol.ConnectionDescriptor
 }
 
 // TODO: the structure of this isn't quite right. We should store the descriptor

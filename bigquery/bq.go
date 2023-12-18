@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/philpearl/bqupload/protocol"
-	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 type bq struct {
@@ -24,7 +25,10 @@ func New(client *managedwriter.Client, log *slog.Logger) *bq {
 
 func (bq *bq) MakeUploader(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error) {
 	// convert the descriptor to a protobuf descriptor
-	var dp *descriptorpb.DescriptorProto
+	dp, err := PlencDescriptorToProtobuf(&desc.Descriptor)
+	if err != nil {
+		return nil, fmt.Errorf("converting descriptor: %w", err)
+	}
 
 	table := managedwriter.TableParentFromParts(desc.ProjectID, desc.DataSetID, desc.TableName)
 	ms, err := bq.client.NewManagedStream(ctx,
@@ -97,8 +101,18 @@ func (bu *bqUload) send(ctx context.Context, b uploadBuffer) {
 		// We really want to know whether this is a fatal error or not. If not
 		// fatal we can retry. We can just keep blocking until it works? TODO:
 		// what?
+
+		if apiErr, ok := apierror.FromError(err); ok {
+			// We now have an instance of APIError, which directly exposes more specific
+			// details about multiple failure conditions include transport-level errors.
+			var storageErr storagepb.StorageError
+			if e := apiErr.Details().ExtractProtoMessage(&storageErr); e == nil &&
+				storageErr.GetCode() == storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS {
+				// TODO: this is a common case. The structure has an additional field that's not yet in the schema. Need to handle this cleanly.
+				bu.log.LogAttrs(ctx, slog.LevelError, "BQ table schema is missing fields", slog.Any("error", err))
+			}
+		}
 		bu.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
-		return
 	}
 
 	for _, re := range full.GetRowErrors() {

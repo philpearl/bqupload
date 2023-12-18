@@ -58,7 +58,7 @@ func TestDescriptor(t *testing.T) {
 						Name:         proto.String("B"),
 						Number:       proto.Int32(2),
 						Label:        descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
-						Type:         descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(),
+						Type:         descriptorpb.FieldDescriptorProto_TYPE_UINT32.Enum(),
 						DefaultValue: proto.String("0"),
 					},
 					{
@@ -162,7 +162,7 @@ func TestDescriptor(t *testing.T) {
 								Name:         proto.String("B"),
 								Number:       proto.Int32(2),
 								Label:        descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
-								Type:         descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(),
+								Type:         descriptorpb.FieldDescriptorProto_TYPE_UINT32.Enum(),
 								DefaultValue: proto.String("0"),
 							},
 							{

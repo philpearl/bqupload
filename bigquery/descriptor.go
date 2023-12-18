@@ -54,7 +54,9 @@ func (b *descriptorBuilder) handleFieldType(elt *plenccodec.Descriptor, f *descr
 	case plenccodec.FieldTypeInt:
 		dtyp = descriptorpb.FieldDescriptorProto_TYPE_SINT64
 	case plenccodec.FieldTypeUint:
-		dtyp = descriptorpb.FieldDescriptorProto_TYPE_UINT64
+		// BigQuery doesn't appear to support uint64. We'll use uint32, but we
+		// probably should distinguish these cases
+		dtyp = descriptorpb.FieldDescriptorProto_TYPE_UINT32
 	case plenccodec.FieldTypeFloat32:
 		dtyp = descriptorpb.FieldDescriptorProto_TYPE_FLOAT
 	case plenccodec.FieldTypeFloat64:
@@ -71,6 +73,10 @@ func (b *descriptorBuilder) handleFieldType(elt *plenccodec.Descriptor, f *descr
 		// Most slices must be noted as packed encoding
 		dtyp = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
 		b.handleFieldType(&elt.Elements[0], f)
+
+		// Repeated fields can't have default values
+		f.DefaultValue = nil
+		return nil
 
 	case plenccodec.FieldTypeStruct:
 		// It looks like structs inside structs are referenced by type name

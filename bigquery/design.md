@@ -1,4 +1,12 @@
 
+- Is this still the wrong model? We perhaps want to disconnect queuing from
+  uploading, so any uploading errors don't stop queuing and are eventually
+  retried.
+  - I think that might just mean that the table writer could be inert, so
+    writing just spills to disk.
+  - and we'd need something to retry creating the managed stream.
+  - might not be needed - managed stream may already do this for us.
+
 - server receives connections
 - first data on a connection describes table and messages
 - server gets a buffer that's associated with that info

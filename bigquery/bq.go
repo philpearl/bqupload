@@ -2,120 +2,119 @@ package bigquery
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"sync"
 
-	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
-	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/philpearl/bqupload/protocol"
+	"github.com/philpearl/plenc"
 )
 
+type writerKey struct {
+	ProjectID string
+	DataSetID string
+	TableName string
+	Hash      string
+}
+
+type uploadGroup struct {
+	tw *TableWriter
+	dw *DiskWriter
+}
+
 type bq struct {
-	client *managedwriter.Client
-	log    *slog.Logger
+	client  *managedwriter.Client
+	log     *slog.Logger
+	baseDir string
+
+	mu        sync.Mutex
+	uploaders map[writerKey]uploadGroup
 }
 
-func New(client *managedwriter.Client, log *slog.Logger) *bq {
+func New(client *managedwriter.Client, log *slog.Logger, baseDir string) *bq {
 	return &bq{
-		client: client,
-		log:    log,
+		client:    client,
+		log:       log,
+		baseDir:   baseDir,
+		uploaders: make(map[writerKey]uploadGroup),
 	}
 }
 
-func (bq *bq) MakeUploader(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error) {
-	// convert the descriptor to a protobuf descriptor
-	dp, err := PlencDescriptorToProtobuf(&desc.Descriptor)
-	if err != nil {
-		return nil, fmt.Errorf("converting descriptor: %w", err)
+func (bq *bq) Wait() {
+	bq.mu.Lock()
+	defer bq.mu.Unlock()
+
+	for _, u := range bq.uploaders {
+		u.tw.Wait()
+	}
+}
+
+func (bq *bq) Stop() error {
+	bq.mu.Lock()
+	defer bq.mu.Unlock()
+
+	// This is just waiting for the uploaders to exit
+	for _, u := range bq.uploaders {
+		u.tw.Stop()
 	}
 
-	table := managedwriter.TableParentFromParts(desc.ProjectID, desc.DataSetID, desc.TableName)
-	ms, err := bq.client.NewManagedStream(ctx,
-		managedwriter.WithDestinationTable(table),
-		managedwriter.WithSchemaDescriptor(dp),
-		managedwriter.EnableWriteRetries(true),
-		managedwriter.WithDataOrigin("bqupload"),
-		managedwriter.WithType(managedwriter.DefaultStream),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("creating managed stream: %w", err)
+	// It's only safe to call this after all the connections have shut down so
+	// there are no senders left.
+	for _, u := range bq.uploaders {
+		u.dw.Stop()
 	}
 
-	ch := make(chan (uploadBuffer), 10)
-	u := &upload{ch: ch}
+	return nil
+}
 
-	bu := newBqUpload(ms, ch, bq.log)
-	u.wg.Add(1)
-	go func() {
-		defer u.wg.Done()
-		bu.run(ctx)
-	}()
+func (bq *bq) GetUploader(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error) {
+	ug, err := bq.getUploadGroup(ctx, desc)
+	if err != nil {
+		return nil, fmt.Errorf("getting upload group: %w", err)
+	}
 
+	// Pumps are per-connection
+	pump := NewPump(ug.tw.inMemory, ug.dw.in, desc)
+	return pump, nil
+}
+
+func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescriptor) (uploadGroup, error) {
+	data, err := plenc.Marshal(nil, &desc.Descriptor)
+	if err != nil {
+		return uploadGroup{}, fmt.Errorf("marshalling descriptor: %w", err)
+	}
+
+	// We want separate streams to BigQuery if we have different schemas. So we
+	// include a hash of the plenc descriptor in the key. Note this won't help
+	// if the schemas are not compatible with each other.
+	hash := sha256.Sum256(data)
+	key := writerKey{ProjectID: desc.ProjectID, DataSetID: desc.DataSetID, TableName: desc.TableName, Hash: hex.EncodeToString(hash[:])}
+
+	bq.mu.Lock()
+	defer bq.mu.Unlock()
+
+	if u, ok := bq.uploaders[key]; ok {
+		return u, nil
+	}
+
+	// We don't have an existing writer, so we create a new set here.
+	tw, err := NewTableWriter(ctx, bq.client, desc, bq.log)
+	if err != nil {
+		return uploadGroup{}, fmt.Errorf("creating table writer: %w", err)
+	}
+
+	dir := filepath.Join(bq.baseDir, key.ProjectID, key.DataSetID, key.TableName, key.Hash)
+	dw, err := NewDiskWriter(dir, bq.log, data)
+	if err != nil {
+		return uploadGroup{}, fmt.Errorf("creating disk writer: %w", err)
+	}
+	tw.Start(ctx)
+	dw.Start()
+	u := uploadGroup{tw: tw, dw: dw}
+	bq.uploaders[key] = u
 	return u, nil
-}
-
-type bqUload struct {
-	ch  <-chan uploadBuffer
-	ms  *managedwriter.ManagedStream
-	log *slog.Logger
-}
-
-func newBqUpload(ms *managedwriter.ManagedStream, ch <-chan uploadBuffer, log *slog.Logger) *bqUload {
-	return &bqUload{
-		ms:  ms,
-		ch:  ch,
-		log: log,
-	}
-}
-
-func (bu *bqUload) run(ctx context.Context) {
-	for b := range bu.ch {
-		bu.send(ctx, b)
-	}
-}
-
-func (bu *bqUload) send(ctx context.Context, b uploadBuffer) {
-	// TODO: we're just logging errors for now.
-	// Longer term we need to decide what to do. I think we either want to
-	//
-	// - retry the full append.
-	// - strip out the bad rows and retry the append.
-	// - drop the full append.
-	//
-	// In future we may also want an option to divert the append or the bad rows
-	// to a dead-letter store
-	res, err := bu.ms.AppendRows(ctx, b.Data)
-	if err != nil {
-		// We really want to know whether this is a fatal error or not. If not
-		// fatal we can retry. We can just keep blocking until it works? TODO:
-		// what?
-		bu.log.LogAttrs(ctx, slog.LevelError, "append rows", slog.Any("error", err))
-		return
-	}
-
-	// TODO: we can read these full responses asynchronously to improve
-	// throughput
-	full, err := res.FullResponse(ctx)
-	if err != nil {
-		// We really want to know whether this is a fatal error or not. If not
-		// fatal we can retry. We can just keep blocking until it works? TODO:
-		// what?
-
-		if apiErr, ok := apierror.FromError(err); ok {
-			// We now have an instance of APIError, which directly exposes more specific
-			// details about multiple failure conditions include transport-level errors.
-			var storageErr storagepb.StorageError
-			if e := apiErr.Details().ExtractProtoMessage(&storageErr); e == nil &&
-				storageErr.GetCode() == storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS {
-				// TODO: this is a common case. The structure has an additional field that's not yet in the schema. Need to handle this cleanly.
-				bu.log.LogAttrs(ctx, slog.LevelError, "BQ table schema is missing fields", slog.Any("error", err))
-			}
-		}
-		bu.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
-	}
-
-	for _, re := range full.GetRowErrors() {
-		bu.log.LogAttrs(ctx, slog.LevelError, "row error", slog.Int64("index", re.Index), slog.String("code", re.Code.String()), slog.String("message", re.Message))
-	}
 }

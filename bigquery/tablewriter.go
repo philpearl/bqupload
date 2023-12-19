@@ -2,36 +2,59 @@ package bigquery
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/googleapis/gax-go/v2/apierror"
+	"github.com/philpearl/bqupload/protocol"
 )
 
 // TableWriter is responsible for sending data to a single table. It pulls data
 // from two channels: one for in-memory buffers and one for disk buffers. It
 // sends data to BigQuery in batches.
 type TableWriter struct {
-	ms  *managedwriter.ManagedStream
-	log *slog.Logger
-	wg  sync.WaitGroup
+	ms     *managedwriter.ManagedStream
+	log    *slog.Logger
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
 
 	inMemory chan uploadBuffer
 	disk     chan uploadBuffer
 }
 
-func NewTableWriter(ms *managedwriter.ManagedStream, log *slog.Logger) *TableWriter {
+func NewTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger) (*TableWriter, error) {
+	// convert the descriptor to a protobuf descriptor
+	dp, err := PlencDescriptorToProtobuf(&desc.Descriptor)
+	if err != nil {
+		return nil, fmt.Errorf("converting descriptor: %w", err)
+	}
+
+	table := managedwriter.TableParentFromParts(desc.ProjectID, desc.DataSetID, desc.TableName)
+	ms, err := client.NewManagedStream(ctx,
+		managedwriter.WithDestinationTable(table),
+		managedwriter.WithSchemaDescriptor(dp),
+		managedwriter.EnableWriteRetries(true),
+		managedwriter.WithDataOrigin("bqupload"),
+		managedwriter.WithType(managedwriter.DefaultStream),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating managed stream: %w", err)
+	}
+
 	return &TableWriter{
 		ms:       ms,
 		log:      log,
 		inMemory: make(chan uploadBuffer),
 		disk:     make(chan uploadBuffer),
-	}
+	}, nil
 }
 
 func (tw *TableWriter) Start(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	tw.cancel = cancel
 	tw.wg.Add(1)
 	go tw.loop(ctx)
 }
@@ -39,7 +62,16 @@ func (tw *TableWriter) Start(ctx context.Context) {
 // Callers to Stop should ensure that they have cancelled the context passed to
 // start.
 func (tw *TableWriter) Stop() {
-	// TODO: not great because it doesn't drain the channels?
+	if tw.cancel != nil {
+		tw.cancel()
+	}
+	// TODO: not great because it doesn't drain the channels? Does that matter since they're unbuffered?
+	tw.wg.Wait()
+}
+
+// Note this isn't safe to call unless the writers to these channels have
+// stopped.
+func (tw *TableWriter) Wait() {
 	close(tw.inMemory)
 	close(tw.disk)
 	tw.wg.Wait()
@@ -47,18 +79,32 @@ func (tw *TableWriter) Stop() {
 
 func (tw *TableWriter) loop(ctx context.Context) {
 	defer tw.wg.Done()
-	for {
+
+	inMemoryOpen, diskOpen := true, true
+	for inMemoryOpen || diskOpen {
 		// wait for a buffer to arrive. We prefer to read from in-memory if
 		// there is one.
 		var buf uploadBuffer
+		var ok bool
 		select {
-		case buf = <-tw.inMemory:
+		case buf, ok = <-tw.inMemory:
+			if !ok {
+				inMemoryOpen = false
+				tw.inMemory = nil
+			}
 		case <-ctx.Done():
 			return
 		default:
 			select {
-			case buf = <-tw.inMemory:
-			case buf = <-tw.disk:
+			case buf, ok = <-tw.inMemory:
+				if !ok {
+					inMemoryOpen = false
+					tw.inMemory = nil
+				}
+			case buf, ok = <-tw.disk:
+				if !ok {
+					diskOpen = false
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -70,6 +116,10 @@ func (tw *TableWriter) loop(ctx context.Context) {
 
 // send sends the buffer to BigQuery.
 func (tw *TableWriter) send(ctx context.Context, b uploadBuffer) {
+	if len(b.Data) == 0 {
+		// nothing to do
+		return
+	}
 	// TODO: we're just logging errors for now.
 	// Longer term we need to decide what to do. I think we either want to
 	//

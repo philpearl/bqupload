@@ -33,6 +33,8 @@ func (f *fakeUploader) Add(buf []byte) {
 	f.data = append(f.data, buf)
 }
 
+func (f *fakeUploader) Flush() {}
+
 func TestClient(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	var pl plenc.Plenc

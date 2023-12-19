@@ -15,11 +15,11 @@ import (
 
 type conn struct {
 	net.Conn
-	makeUploader bigquery.UploaderFactory
+	getUploader bigquery.UploaderFactory
 }
 
 func newConn(c net.Conn, makeUploader bigquery.UploaderFactory) conn {
-	return conn{Conn: c, makeUploader: makeUploader}
+	return conn{Conn: c, getUploader: makeUploader}
 }
 
 func (c *conn) do(ctx context.Context) error {
@@ -44,10 +44,12 @@ func (c *conn) do(ctx context.Context) error {
 	}
 
 	// Here's where we create the stream we're using for uploading
-	u, err := c.makeUploader(ctx, &desc)
+	u, err := c.getUploader(ctx, &desc)
 	if err != nil {
 		return fmt.Errorf("creating uploader: %w", err)
 	}
+
+	defer u.Flush()
 
 	// TODO: if there's no traffic for a while we want to be able to push what
 	// we have in hand. Perhaps some deadlines on the reads?

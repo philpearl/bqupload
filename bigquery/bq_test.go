@@ -96,7 +96,9 @@ func TestCanWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bq := New(cli, log)
+	dir := t.TempDir()
+
+	bq := New(cli, log, dir)
 
 	rows := []Row{
 		{
@@ -132,7 +134,7 @@ func TestCanWrite(t *testing.T) {
 	}
 	d := codec.Descriptor()
 
-	up, err := bq.MakeUploader(ctx, &protocol.ConnectionDescriptor{
+	up, err := bq.GetUploader(ctx, &protocol.ConnectionDescriptor{
 		ProjectID:  projectID,
 		DataSetID:  datasetID,
 		TableName:  tableID,
@@ -155,8 +157,11 @@ func TestCanWrite(t *testing.T) {
 		up.Add(d)
 	}
 
-	upl := up.(*upload)
-	upl.Wait()
+	// This ensures the data is written to the tablewriter
+	up.Flush()
+
+	// But we have then to wait until the table writers have drained and shut down
+	bq.Wait()
 
 	it, err := client.Query(fmt.Sprintf("SELECT * FROM `%s.%s.%s`", projectID, datasetID, tableID)).Read(ctx)
 	if err != nil {
@@ -182,6 +187,7 @@ func TestCanWrite(t *testing.T) {
 	// TODO:
 	// - [x] clean table before starting
 	// - [ ] check the rows are there and correct
+	// - [ ] table reading method doesn't work with null.XXX types.
 }
 
 func createTestTable(client *bigquery.Client, projectID, datasetID, tableID string) error {

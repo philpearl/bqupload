@@ -3,7 +3,9 @@ package bigquery
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,19 +19,19 @@ import (
 
 /*
 TODO:
-- [ ] make creating the data on disk atomic
+- [x] make creating the data on disk atomic
 - [x] create the disk readers for each table.
 - [x] create the disk reader manager
 - [X] handle sleeping for the disk reader
-- [ ] plumb everything together
+- [x] plumb everything together
 - [x] directory should be a hash of the descriptor
 - [ ] clean up empty directories
 
 */
 
-// DiskWriter handles writing buffers to disk. One DiskWriter is created per
+// diskWriter handles writing buffers to disk. One diskWriter is created per
 // table & descriptor.
-type DiskWriter struct {
+type diskWriter struct {
 	// Where this disk writer is writing to
 	baseDir string
 	// Channel on which buffers are sent to the disk writer
@@ -38,8 +40,8 @@ type DiskWriter struct {
 	log *slog.Logger
 }
 
-func NewDiskWriter(baseDir string, log *slog.Logger, desc []byte) (*DiskWriter, error) {
-	dw := &DiskWriter{
+func newDiskWriter(baseDir string, log *slog.Logger, desc []byte) (*diskWriter, error) {
+	dw := &diskWriter{
 		baseDir: baseDir,
 		in:      make(chan uploadBuffer, 100),
 		log:     log,
@@ -51,25 +53,29 @@ func NewDiskWriter(baseDir string, log *slog.Logger, desc []byte) (*DiskWriter, 
 	// Write the descriptor to disk if not already present
 	descName := filepath.Join(baseDir, "descriptor")
 	if _, err := os.Stat(descName); os.IsNotExist(err) {
-		if err := os.WriteFile(descName, desc, 0o644); err != nil {
+		tempName := descName + ".new"
+		if err := os.WriteFile(tempName, desc, 0o644); err != nil {
 			return nil, fmt.Errorf("writing descriptor: %w", err)
+		}
+		if err := os.Rename(tempName, descName); err != nil {
+			return nil, fmt.Errorf("renaming descriptor: %w", err)
 		}
 	}
 
 	return dw, nil
 }
 
-func (dw *DiskWriter) Start() {
+func (dw *diskWriter) start() {
 	dw.wg.Add(1)
 	go dw.loop()
 }
 
-func (dw *DiskWriter) Stop() {
+func (dw *diskWriter) stop() {
 	close(dw.in)
 	dw.wg.Wait()
 }
 
-func (dw *DiskWriter) loop() {
+func (dw *diskWriter) loop() {
 	defer dw.wg.Done()
 	for buf := range dw.in {
 		if err := dw.writeBufferToDisk(buf); err != nil {
@@ -78,7 +84,7 @@ func (dw *DiskWriter) loop() {
 	}
 }
 
-func (dw *DiskWriter) writeBufferToDisk(buf uploadBuffer) error {
+func (dw *diskWriter) writeBufferToDisk(buf uploadBuffer) error {
 	uploadID := uuid.NewString()
 	bufDir := filepath.Join(dw.baseDir, uploadID)
 	if err := os.MkdirAll(bufDir, 0o755); err != nil {
@@ -95,15 +101,20 @@ func (dw *DiskWriter) writeBufferToDisk(buf uploadBuffer) error {
 	for i, l := range buf.Data {
 		binary.BigEndian.PutUint32(lbuf[i*4:], uint32(len(l)))
 	}
-	if err := os.WriteFile(filepath.Join(bufDir, "lengths"), lbuf, 0o644); err != nil {
+	lengthsName := filepath.Join(bufDir, "lengths")
+	lengthsNameNew := lengthsName + ".new"
+	if err := os.WriteFile(lengthsNameNew, lbuf, 0o644); err != nil {
 		return fmt.Errorf("writing lengths: %w", err)
+	}
+	if err := os.Rename(lengthsNameNew, lengthsName); err != nil {
+		return fmt.Errorf("renaming lengths: %w", err)
 	}
 	return nil
 }
 
-// TableDiskReader reads buffers from disk and sends them to the uploader. One
-// TableDiskReader is created per table & descriptor
-type TableDiskReader struct {
+// tableDiskReader reads buffers from disk and sends them to the uploader. One
+// tableDiskReader is created per table & descriptor
+type tableDiskReader struct {
 	tableDir string
 	log      *slog.Logger
 	// This is expected to be an unbuffered channel and we'll only be able to
@@ -115,7 +126,7 @@ type TableDiskReader struct {
 	desc *protocol.ConnectionDescriptor
 }
 
-func NewTableDiskReader(tableDir string, log *slog.Logger) (*TableDiskReader, error) {
+func newTableDiskReader(tableDir string, log *slog.Logger) (*tableDiskReader, error) {
 	var desc protocol.ConnectionDescriptor
 	data, err := os.ReadFile(filepath.Join(tableDir, "descriptor"))
 	if err != nil {
@@ -125,14 +136,14 @@ func NewTableDiskReader(tableDir string, log *slog.Logger) (*TableDiskReader, er
 		return nil, fmt.Errorf("unmarshalling descriptor: %w", err)
 	}
 
-	return &TableDiskReader{
+	return &tableDiskReader{
 		tableDir: tableDir,
 		log:      log,
 		desc:     &desc,
 	}, nil
 }
 
-func (tdr *TableDiskReader) Start(ctx context.Context, out chan<- uploadBuffer) {
+func (tdr *tableDiskReader) Start(ctx context.Context, out chan<- uploadBuffer) {
 	ctx, cancel := context.WithCancel(ctx)
 	tdr.cancel = cancel
 	tdr.out = out
@@ -140,14 +151,14 @@ func (tdr *TableDiskReader) Start(ctx context.Context, out chan<- uploadBuffer) 
 	go tdr.loop(ctx)
 }
 
-func (tdr *TableDiskReader) Stop() {
+func (tdr *tableDiskReader) Stop() {
 	if tdr.cancel != nil {
 		tdr.cancel()
 	}
 	tdr.wg.Wait()
 }
 
-func (tdr *TableDiskReader) loop(ctx context.Context) {
+func (tdr *tableDiskReader) loop(ctx context.Context) {
 	defer tdr.wg.Done()
 
 	for {
@@ -181,16 +192,22 @@ func (tdr *TableDiskReader) loop(ctx context.Context) {
 	}
 }
 
-func (tdr *TableDiskReader) processFile(ctx context.Context, bufDir string) error {
+func (tdr *tableDiskReader) processFile(ctx context.Context, bufDir string) error {
+	// Read lengths first because it is written last (and written atomically).
+	// If it isn't present this file isn't ready to be read yet.
+	lbuf, err := os.ReadFile(filepath.Join(bufDir, "lengths"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// Not ready to be read yet
+			return nil
+		}
+		return fmt.Errorf("reading lengths: %w", err)
+	}
+	l := len(lbuf) / 4
 	dbuf, err := os.ReadFile(filepath.Join(bufDir, "data"))
 	if err != nil {
 		return fmt.Errorf("reading data: %w", err)
 	}
-	lbuf, err := os.ReadFile(filepath.Join(bufDir, "lengths"))
-	if err != nil {
-		return fmt.Errorf("reading lengths: %w", err)
-	}
-	l := len(lbuf) / 4
 
 	u := uploadBuffer{
 		buf:  dbuf,
@@ -219,23 +236,25 @@ func (tdr *TableDiskReader) processFile(ctx context.Context, bufDir string) erro
 	return nil
 }
 
+type chanForDescriptor func(context.Context, *protocol.ConnectionDescriptor) (chan<- uploadBuffer, error)
+
 type DiskReadManager struct {
 	baseDir string
 	log     *slog.Logger
 
-	bq     *bq
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	chanForDescriptor chanForDescriptor
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 
-	diskReaders map[writerKey]*TableDiskReader
+	diskReaders map[writerKey]*tableDiskReader
 }
 
-func NewDiskReadManager(baseDir string, log *slog.Logger, bq *bq) *DiskReadManager {
+func NewDiskReadManager(baseDir string, log *slog.Logger, chanForDescriptor chanForDescriptor) *DiskReadManager {
 	return &DiskReadManager{
-		baseDir:     baseDir,
-		log:         log,
-		bq:          bq,
-		diskReaders: make(map[writerKey]*TableDiskReader),
+		baseDir:           baseDir,
+		log:               log,
+		chanForDescriptor: chanForDescriptor,
+		diskReaders:       make(map[writerKey]*tableDiskReader),
 	}
 }
 
@@ -336,18 +355,20 @@ func (drm *DiskReadManager) scanTable(ctx context.Context, projectID, dataSetID,
 		key := writerKey{ProjectID: projectID, DataSetID: dataSetID, TableName: tableName, Hash: hash}
 		if _, ok := drm.diskReaders[key]; !ok {
 
-			tdr, err := NewTableDiskReader(filepath.Join(tableDir, hash), drm.log)
+			tdr, err := newTableDiskReader(filepath.Join(tableDir, hash), drm.log)
 			if err != nil {
-				drm.log.LogAttrs(ctx, slog.LevelError, "creating table disk reader", slog.Any("error", err), slog.String("project", projectID), slog.String("dataset", dataSetID))
+				if !errors.Is(err, fs.ErrNotExist) {
+					drm.log.LogAttrs(ctx, slog.LevelError, "creating table disk reader", slog.Any("error", err), slog.String("project", projectID), slog.String("dataset", dataSetID))
+				}
 				continue
 			}
 
-			ug, err := drm.bq.getUploadGroup(ctx, tdr.desc)
+			ch, err := drm.chanForDescriptor(ctx, tdr.desc)
 			if err != nil {
-				drm.log.LogAttrs(ctx, slog.LevelError, "getting upload group", slog.Any("error", err), slog.String("project", projectID), slog.String("dataset", dataSetID))
+				drm.log.LogAttrs(ctx, slog.LevelError, "getting write channel", slog.Any("error", err), slog.String("project", projectID), slog.String("dataset", dataSetID))
 				continue
 			}
-			tdr.Start(ctx, ug.tw.inMemory)
+			tdr.Start(ctx, ch)
 
 			drm.diskReaders[key] = tdr
 		}

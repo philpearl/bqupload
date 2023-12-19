@@ -12,10 +12,10 @@ import (
 	"github.com/philpearl/bqupload/protocol"
 )
 
-// TableWriter is responsible for sending data to a single table. It pulls data
+// tableWriter is responsible for sending data to a single table. It pulls data
 // from two channels: one for in-memory buffers and one for disk buffers. It
 // sends data to BigQuery in batches.
-type TableWriter struct {
+type tableWriter struct {
 	ms     *managedwriter.ManagedStream
 	log    *slog.Logger
 	wg     sync.WaitGroup
@@ -25,7 +25,7 @@ type TableWriter struct {
 	disk     chan uploadBuffer
 }
 
-func NewTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger) (*TableWriter, error) {
+func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger) (*tableWriter, error) {
 	// convert the descriptor to a protobuf descriptor
 	dp, err := PlencDescriptorToProtobuf(&desc.Descriptor)
 	if err != nil {
@@ -44,7 +44,7 @@ func NewTableWriter(ctx context.Context, client *managedwriter.Client, desc *pro
 		return nil, fmt.Errorf("creating managed stream: %w", err)
 	}
 
-	return &TableWriter{
+	return &tableWriter{
 		ms:       ms,
 		log:      log,
 		inMemory: make(chan uploadBuffer),
@@ -52,16 +52,16 @@ func NewTableWriter(ctx context.Context, client *managedwriter.Client, desc *pro
 	}, nil
 }
 
-func (tw *TableWriter) Start(ctx context.Context) {
+func (tw *tableWriter) start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	tw.cancel = cancel
 	tw.wg.Add(1)
 	go tw.loop(ctx)
 }
 
-// Callers to Stop should ensure that they have cancelled the context passed to
+// Callers to stop should ensure that they have cancelled the context passed to
 // start.
-func (tw *TableWriter) Stop() {
+func (tw *tableWriter) stop() {
 	if tw.cancel != nil {
 		tw.cancel()
 	}
@@ -71,13 +71,13 @@ func (tw *TableWriter) Stop() {
 
 // Note this isn't safe to call unless the writers to these channels have
 // stopped.
-func (tw *TableWriter) Wait() {
+func (tw *tableWriter) wait() {
 	close(tw.inMemory)
 	close(tw.disk)
 	tw.wg.Wait()
 }
 
-func (tw *TableWriter) loop(ctx context.Context) {
+func (tw *tableWriter) loop(ctx context.Context) {
 	defer tw.wg.Done()
 
 	inMemoryOpen, diskOpen := true, true
@@ -115,7 +115,7 @@ func (tw *TableWriter) loop(ctx context.Context) {
 }
 
 // send sends the buffer to BigQuery.
-func (tw *TableWriter) send(ctx context.Context, b uploadBuffer) {
+func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 	if len(b.Data) == 0 {
 		// nothing to do
 		return

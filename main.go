@@ -57,7 +57,7 @@ func run() error {
 	}
 
 	bq := bigquery.New(cli, log, o.baseDir)
-	drm := bigquery.NewDiskReadManager(o.baseDir, log, bq)
+	drm := bigquery.NewDiskReadManager(o.baseDir, log, bq.GetChanForDescriptor)
 	drm.Start(ctx)
 
 	s := server.New(o.addr, log, bq.GetUploader)

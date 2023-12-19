@@ -25,9 +25,3 @@ type Uploader interface {
 }
 
 type UploaderFactory func(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error)
-
-// Fields are public to make testing easier
-type uploadBuffer struct {
-	buf  []byte
-	Data [][]byte
-}

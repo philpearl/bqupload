@@ -22,8 +22,8 @@ type writerKey struct {
 }
 
 type uploadGroup struct {
-	tw *TableWriter
-	dw *DiskWriter
+	tw *tableWriter
+	dw *diskWriter
 }
 
 type bq struct {
@@ -49,7 +49,7 @@ func (bq *bq) Wait() {
 	defer bq.mu.Unlock()
 
 	for _, u := range bq.uploaders {
-		u.tw.Wait()
+		u.tw.wait()
 	}
 }
 
@@ -59,13 +59,13 @@ func (bq *bq) Stop() error {
 
 	// This is just waiting for the uploaders to exit
 	for _, u := range bq.uploaders {
-		u.tw.Stop()
+		u.tw.stop()
 	}
 
 	// It's only safe to call this after all the connections have shut down so
 	// there are no senders left.
 	for _, u := range bq.uploaders {
-		u.dw.Stop()
+		u.dw.stop()
 	}
 
 	return nil
@@ -78,8 +78,16 @@ func (bq *bq) GetUploader(ctx context.Context, desc *protocol.ConnectionDescript
 	}
 
 	// Pumps are per-connection
-	pump := NewPump(ug.tw.inMemory, ug.dw.in, desc)
+	pump := newPump(ug.tw.inMemory, ug.dw.in, desc)
 	return pump, nil
+}
+
+func (bq *bq) GetChanForDescriptor(ctx context.Context, desc *protocol.ConnectionDescriptor) (chan<- uploadBuffer, error) {
+	ug, err := bq.getUploadGroup(ctx, desc)
+	if err != nil {
+		return nil, fmt.Errorf("getting upload group: %w", err)
+	}
+	return ug.tw.inMemory, nil
 }
 
 func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescriptor) (uploadGroup, error) {
@@ -102,18 +110,18 @@ func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescr
 	}
 
 	// We don't have an existing writer, so we create a new set here.
-	tw, err := NewTableWriter(ctx, bq.client, desc, bq.log)
+	tw, err := newTableWriter(ctx, bq.client, desc, bq.log)
 	if err != nil {
 		return uploadGroup{}, fmt.Errorf("creating table writer: %w", err)
 	}
 
 	dir := filepath.Join(bq.baseDir, key.ProjectID, key.DataSetID, key.TableName, key.Hash)
-	dw, err := NewDiskWriter(dir, bq.log, data)
+	dw, err := newDiskWriter(dir, bq.log, data)
 	if err != nil {
 		return uploadGroup{}, fmt.Errorf("creating disk writer: %w", err)
 	}
-	tw.Start(ctx)
-	dw.Start()
+	tw.start(ctx)
+	dw.start()
 	u := uploadGroup{tw: tw, dw: dw}
 	bq.uploaders[key] = u
 	return u, nil

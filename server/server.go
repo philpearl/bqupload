@@ -17,6 +17,8 @@ type Server struct {
 	listener     net.Listener
 	eg           errgroup.Group
 	makeUploader bigquery.UploaderFactory
+
+	cancel context.CancelFunc
 }
 
 func New(addr string, log *slog.Logger, makeUploader bigquery.UploaderFactory) *Server {
@@ -24,6 +26,7 @@ func New(addr string, log *slog.Logger, makeUploader bigquery.UploaderFactory) *
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	ctx, s.cancel = context.WithCancel(ctx)
 	var lc net.ListenConfig
 
 	ln, err := lc.Listen(ctx, "tcp", s.addr)
@@ -53,6 +56,9 @@ func (s *Server) Addr() net.Addr {
 }
 
 func (s *Server) Stop() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if err := s.listener.Close(); err != nil {
 		return fmt.Errorf("closing listener: %w", err)
 	}

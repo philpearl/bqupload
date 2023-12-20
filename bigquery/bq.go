@@ -79,6 +79,7 @@ func (bq *bq) GetUploader(ctx context.Context, desc *protocol.ConnectionDescript
 
 	// Pumps are per-connection
 	pump := newPump(ug.tw.inMemory, ug.dw.in, desc)
+	pump.start(ctx)
 	return pump, nil
 }
 

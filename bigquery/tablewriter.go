@@ -118,6 +118,7 @@ func (tw *tableWriter) loop(ctx context.Context) {
 func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 	if len(b.Data) == 0 {
 		// nothing to do
+		b.f(b, nil)
 		return
 	}
 	// TODO: we're just logging errors for now.
@@ -135,6 +136,7 @@ func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 		// fatal we can retry. We can just keep blocking until it works? TODO:
 		// what?
 		tw.log.LogAttrs(ctx, slog.LevelError, "append rows", slog.Any("error", err))
+		b.f(b, err)
 		return
 	}
 
@@ -159,7 +161,17 @@ func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 		tw.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
 	}
 
-	for _, re := range full.GetRowErrors() {
-		tw.log.LogAttrs(ctx, slog.LevelError, "row error", slog.Int64("index", re.Index), slog.String("code", re.Code.String()), slog.String("message", re.Message))
+	rowErrors := full.GetRowErrors()
+	for _, re := range rowErrors {
+		tw.log.LogAttrs(ctx, slog.LevelError, "row error",
+			slog.Int64("index", re.Index),
+			slog.String("code", re.Code.String()),
+			slog.String("message", re.Message))
 	}
+
+	if err == nil && len(rowErrors) > 0 {
+		err = fmt.Errorf("row errors")
+	}
+
+	b.f(b, err)
 }

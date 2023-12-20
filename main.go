@@ -27,7 +27,7 @@ type opts struct {
 
 func (o *opts) registerFlags() {
 	flag.StringVar(&o.baseDir, "base-dir", "", "base directory for disk storage")
-	flag.StringVar(&o.addr, "addr", ":8080", "address to listen on")
+	flag.StringVar(&o.addr, "addr", ":8123", "address to listen on")
 }
 
 func (o *opts) validate() error {
@@ -67,9 +67,13 @@ func run() error {
 
 	// block forever while the server runs.
 	<-ctx.Done()
+	log.Info("shutting down")
 
 	s.Stop()
 	drm.Stop()
+	bq.Stop()
+
+	log.Info("shut down")
 
 	// TODO: wait for all uploads to finish or flush to disk
 

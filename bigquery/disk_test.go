@@ -67,15 +67,24 @@ func TestDisk(t *testing.T) {
 
 	var result []uploadBuffer
 	for i := 0; i < 3; i++ {
-		result = append(result, <-ch)
+		u := <-ch
+		u.f(u, nil)
+		result = append(result, u)
 	}
 
 	// TODO: order is random because of random uuids
-	if diff := cmp.Diff([]uploadBuffer{
-		{Data: [][]byte{buf[:3], buf[3:]}, buf: buf},
-		{Data: [][]byte{buf[:4], buf[4:]}, buf: buf},
-		{Data: [][]byte{buf[:5], buf[5:]}, buf: buf},
-	}, result, cmpopts.IgnoreUnexported(uploadBuffer{})); diff != "" {
+	if diff := cmp.Diff(
+		[]uploadBuffer{
+			{Data: [][]byte{buf[:3], buf[3:]}, buf: buf},
+			{Data: [][]byte{buf[:4], buf[4:]}, buf: buf},
+			{Data: [][]byte{buf[:5], buf[5:]}, buf: buf},
+		},
+		result,
+		cmpopts.IgnoreUnexported(uploadBuffer{}),
+		cmpopts.SortSlices(func(a, b uploadBuffer) bool {
+			return len(a.Data[0]) < len(b.Data[0])
+		}),
+	); diff != "" {
 		t.Fatal(diff)
 	}
 }

@@ -26,7 +26,7 @@ TODO:
 - [x] directory should be a hash of the descriptor
 - [ ] clean up empty directories
 - [ ] clean up partial writes on start-up
-- [ ] track inprogress uploads & upload completions
+- [x] track inprogress uploads & upload completions
 
 */
 
@@ -195,6 +195,7 @@ func newTableDiskReader(tableDir string, log *slog.Logger) (*tableDiskReader, er
 		tableDir: tableDir,
 		log:      log,
 		desc:     &desc,
+		inflight: make(map[string]struct{}),
 	}, nil
 }
 

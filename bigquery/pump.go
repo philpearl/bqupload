@@ -1,18 +1,9 @@
 package bigquery
 
-import (
-	"context"
-	"sync"
-	"time"
-
-	"github.com/philpearl/bqupload/protocol"
-)
-
 /*
 TODO:
 - [ ] flush the current buffer to disk on stop (I think this should work now?)
 - [x] delay between retries
-- [ ] does connection closure cancel the pump context?
 */
 
 // pump is essentially a buffer manager. It manages a buffer of data to be
@@ -35,88 +26,17 @@ type pump struct {
 	// accessed by a single goroutine, so we do not guard it with locks
 	currentBuffer uploadBuffer
 
-	mu     sync.Mutex
-	wg     sync.WaitGroup
-	cancel context.CancelFunc
-	// We only have this to check whether it's done
-	ctx         context.Context
-	retryBuffer uploadBuffer
+	completionFunc uploadCompletionFunc
 }
 
-func newPump(tw, dw chan<- uploadBuffer, desc *protocol.ConnectionDescriptor) *pump {
+func newPump(tw, dw chan<- uploadBuffer, completionFunc uploadCompletionFunc) *pump {
 	p := &pump{
-		tw: tw,
-		dw: dw,
+		tw:             tw,
+		dw:             dw,
+		completionFunc: completionFunc,
 	}
-
-	p.currentBuffer.f = p.completionFunc
+	p.currentBuffer.regenerate()
 	return p
-}
-
-func (p *pump) start(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
-	p.cancel = cancel
-	p.wg.Add(1)
-	go p.retryLoop(ctx)
-}
-
-func (p *pump) stop() {
-	if p.cancel != nil {
-		p.cancel()
-	}
-	p.wg.Wait()
-}
-
-func (p *pump) completionFunc(u uploadBuffer, err error) {
-	if err == nil {
-		return
-	}
-
-	p.mu.Lock()
-
-	// If we're not shutting down then we can try to combine this buffer with
-	// what we're already retrying.
-	if p.ctx.Err() == nil && p.retryBuffer.combine(u) {
-		p.mu.Unlock()
-		return
-	}
-	// Can't combine the buffers. We don't want too much data in memory, so we'll
-	// spill the larger of the two buffers to disk, and retry it from disk.
-	if len(p.retryBuffer.Data) < len(u.Data) {
-		u, p.retryBuffer = p.retryBuffer, u
-	}
-	p.mu.Unlock()
-
-	// This can block so we don't want to hold the lock at this point
-	p.dw <- u
-}
-
-func (p *pump) retryLoop(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
-	for {
-		select {
-		case <-ctx.Done():
-			// Shutting down. Send the retry buffer if there's anything in it
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			if p.retryBuffer.len > 0 {
-				p.dw <- p.retryBuffer
-			}
-			return
-		case <-t.C:
-		}
-		// Attempt to send the retry buffer
-		p.mu.Lock()
-		if p.retryBuffer.len == 0 {
-			p.mu.Unlock()
-			continue
-		}
-		b := p.retryBuffer
-		p.retryBuffer.zero()
-		p.mu.Unlock()
-
-		p.send(&b)
-	}
 }
 
 // BufferFor returns a buffer of exactly size bytes. If the current uploadBuffer
@@ -129,7 +49,7 @@ func (p *pump) BufferFor(size int) []byte {
 
 	// To keep data timely, if we can send to the table writer, do so. Otherwise
 	// we'll keep queuing.
-	if len(p.currentBuffer.buf) > minUploadCount {
+	if len(p.currentBuffer.Data) > minUploadCount {
 		select {
 		case p.tw <- p.currentBuffer:
 			p.currentBuffer.regenerate()
@@ -147,80 +67,21 @@ func (p *pump) Add(buf []byte) {
 }
 
 func (p *pump) Flush() {
-	p.send(&p.currentBuffer)
-}
-
-func (p *pump) send(u *uploadBuffer) {
-	if len(u.Data) == 0 {
+	if len(p.currentBuffer.Data) == 0 {
 		return
 	}
-	u.f = p.completionFunc
+	p.currentBuffer.f = p.completionFunc
 	select {
-	case p.tw <- *u:
+	case p.tw <- p.currentBuffer:
 	default:
 		// This will block until the buffer is sent. If we're shutting down the
 		// table writer should stop reading and we'll write to disk.
 		select {
-		case p.tw <- *u:
-		case p.dw <- *u:
+		case p.tw <- p.currentBuffer:
+		case p.dw <- p.currentBuffer:
 		}
 	}
+
 	// We've sent the buffer - make a new one
-	u.regenerate()
-}
-
-type uploadCompletionFunc func(u uploadBuffer, err error)
-
-// Fields are public to make testing easier
-type uploadBuffer struct {
-	len  int
-	buf  []byte
-	Data [][]byte
-	f    uploadCompletionFunc
-}
-
-func (u *uploadBuffer) regenerate() {
-	u.len = 0
-	u.buf = make([]byte, maxUploadBytes)
-	u.Data = make([][]byte, 0, maxUploadCount)
-}
-
-func (u *uploadBuffer) zero() {
-	u.len = 0
-	u.buf = nil
-	u.Data = nil
-}
-
-func (u *uploadBuffer) spaceFor(size int) bool {
-	return u.len+size <= cap(u.buf) && len(u.Data) < maxUploadCount
-}
-
-func (u *uploadBuffer) next(size int) []byte {
-	return u.buf[u.len : size+u.len]
-}
-
-func (u *uploadBuffer) add(buf []byte) {
-	u.len += len(buf)
-	u.Data = append(u.Data, buf)
-}
-
-func (u *uploadBuffer) combine(v uploadBuffer) (ok bool) {
-	if len(u.buf) == 0 {
-		*u = v
-		return true
-	}
-
-	if u.len+v.len > cap(u.buf) {
-		return false
-	}
-	if len(u.Data)+len(v.Data) > cap(u.Data) {
-		return false
-	}
-	copy(u.buf[u.len:], v.buf[:v.len])
-	for _, d := range v.Data {
-		l := len(d)
-		u.Data = append(u.Data, u.buf[u.len:u.len+l])
-		u.len += l
-	}
-	return true
+	p.currentBuffer.regenerate()
 }

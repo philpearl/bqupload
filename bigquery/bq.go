@@ -24,6 +24,22 @@ type writerKey struct {
 type uploadGroup struct {
 	tw *tableWriter
 	dw *diskWriter
+	rq *retryQueue
+}
+
+func (u *uploadGroup) start(ctx context.Context) {
+	u.tw.start(ctx)
+	u.dw.start()
+	u.rq.start(ctx)
+}
+
+func (u *uploadGroup) stop() {
+	// Stop the retry queues first so they don't try to send anything to the
+	// table writers. The retry queues will still exist, but will only send to
+	// the disk writers.
+	u.rq.stop()
+	u.tw.stop()
+	u.dw.stop()
 }
 
 type bq struct {
@@ -53,22 +69,13 @@ func (bq *bq) Wait() {
 	}
 }
 
-func (bq *bq) Stop() error {
+func (bq *bq) Stop() {
 	bq.mu.Lock()
 	defer bq.mu.Unlock()
 
-	// This is just waiting for the uploaders to exit
 	for _, u := range bq.uploaders {
-		u.tw.stop()
+		u.stop()
 	}
-
-	// It's only safe to call this after all the connections have shut down so
-	// there are no senders left.
-	for _, u := range bq.uploaders {
-		u.dw.stop()
-	}
-
-	return nil
 }
 
 func (bq *bq) GetUploader(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error) {
@@ -78,8 +85,7 @@ func (bq *bq) GetUploader(ctx context.Context, desc *protocol.ConnectionDescript
 	}
 
 	// Pumps are per-connection
-	pump := newPump(ug.tw.inMemory, ug.dw.in, desc)
-	pump.start(ctx)
+	pump := newPump(ug.tw.inMemory, ug.dw.in, ug.rq.completionFunc)
 	return pump, nil
 }
 
@@ -121,9 +127,12 @@ func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescr
 	if err != nil {
 		return uploadGroup{}, fmt.Errorf("creating disk writer: %w", err)
 	}
-	tw.start(ctx)
-	dw.start()
-	u := uploadGroup{tw: tw, dw: dw}
+
+	rg := newRetryQueue(tw.inMemory, dw.in)
+	u := uploadGroup{tw: tw, dw: dw, rq: rg}
+
+	u.start(ctx)
+
 	bq.uploaders[key] = u
 	return u, nil
 }

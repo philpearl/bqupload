@@ -45,7 +45,7 @@ func (s *Server) Start(ctx context.Context) error {
 				return fmt.Errorf("accepting connection: %w", err)
 			}
 			s.log.LogAttrs(context.Background(), slog.LevelInfo, "new connection", slog.Any("remote", conn.RemoteAddr()))
-			go s.onNewConnection(ctx, conn)
+			go s.onNewConnection(ctx, conn.(*net.TCPConn))
 		}
 	})
 	return nil
@@ -65,7 +65,7 @@ func (s *Server) Stop() error {
 	return s.eg.Wait()
 }
 
-func (s *Server) onNewConnection(ctx context.Context, conn net.Conn) {
+func (s *Server) onNewConnection(ctx context.Context, conn *net.TCPConn) {
 	defer conn.Close()
 	c := newConn(conn, s.makeUploader)
 	if err := c.do(ctx); err != nil {

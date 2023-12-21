@@ -14,15 +14,18 @@ import (
 )
 
 type conn struct {
-	net.Conn
+	*net.TCPConn
 	getUploader bigquery.UploaderFactory
 }
 
-func newConn(c net.Conn, makeUploader bigquery.UploaderFactory) conn {
-	return conn{Conn: c, getUploader: makeUploader}
+func newConn(c *net.TCPConn, makeUploader bigquery.UploaderFactory) conn {
+	return conn{TCPConn: c, getUploader: makeUploader}
 }
 
 func (c *conn) do(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, func() { c.CloseRead() })
+	defer stop()
+	defer c.Close()
 	// First we read the stream descriptor. This contains the target table and the
 	// protobuf schema descriptor.
 	var lengthBuf [4]byte

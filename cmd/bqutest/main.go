@@ -72,6 +72,7 @@ func (o *opt) run() error {
 		return fmt.Errorf("validating options: %w", err)
 	}
 
+	// Set up the plenc codec
 	var pl plenc.Plenc
 	pl.ProtoCompatibleArrays = true
 	pl.RegisterDefaultCodecs()

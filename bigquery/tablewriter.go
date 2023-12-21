@@ -23,6 +23,12 @@ type tableWriter struct {
 
 	inMemory chan uploadBuffer
 	disk     chan uploadBuffer
+	results  chan partialResult
+}
+
+type partialResult struct {
+	b   uploadBuffer
+	res *managedwriter.AppendResult
 }
 
 func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger) (*tableWriter, error) {
@@ -49,13 +55,15 @@ func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *pro
 		log:      log,
 		inMemory: make(chan uploadBuffer),
 		disk:     make(chan uploadBuffer),
+		results:  make(chan partialResult, 10),
 	}, nil
 }
 
 func (tw *tableWriter) start(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	tw.cancel = cancel
-	tw.wg.Add(1)
+	tw.wg.Add(2)
+	go tw.resultLoop(ctx)
 	go tw.loop(ctx)
 }
 
@@ -79,6 +87,7 @@ func (tw *tableWriter) wait() {
 
 func (tw *tableWriter) loop(ctx context.Context) {
 	defer tw.wg.Done()
+	defer close(tw.results)
 
 	inMemoryOpen, diskOpen := true, true
 	for inMemoryOpen || diskOpen {
@@ -140,38 +149,45 @@ func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 		return
 	}
 
-	// TODO: we can read these full responses asynchronously to improve
+	// we can read these full responses asynchronously to improve
 	// throughput
-	full, err := res.FullResponse(ctx)
-	if err != nil {
-		// We really want to know whether this is a fatal error or not. If not
-		// fatal we can retry. We can just keep blocking until it works? TODO:
-		// what?
+	tw.results <- partialResult{b: b, res: res}
+}
 
-		if apiErr, ok := apierror.FromError(err); ok {
-			// We now have an instance of APIError, which directly exposes more specific
-			// details about multiple failure conditions include transport-level errors.
-			var storageErr storagepb.StorageError
-			if e := apiErr.Details().ExtractProtoMessage(&storageErr); e == nil &&
-				storageErr.GetCode() == storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS {
-				// TODO: this is a common case. The structure has an additional field that's not yet in the schema. Need to handle this cleanly.
-				tw.log.LogAttrs(ctx, slog.LevelError, "BQ table schema is missing fields", slog.Any("error", err))
+func (tw *tableWriter) resultLoop(ctx context.Context) {
+	defer tw.wg.Done()
+	for pr := range tw.results {
+		full, err := pr.res.FullResponse(ctx)
+		if err != nil {
+			// We really want to know whether this is a fatal error or not. If not
+			// fatal we can retry. We can just keep blocking until it works? TODO:
+			// what?
+
+			if apiErr, ok := apierror.FromError(err); ok {
+				// We now have an instance of APIError, which directly exposes more specific
+				// details about multiple failure conditions include transport-level errors.
+				var storageErr storagepb.StorageError
+				if e := apiErr.Details().ExtractProtoMessage(&storageErr); e == nil &&
+					storageErr.GetCode() == storagepb.StorageError_SCHEMA_MISMATCH_EXTRA_FIELDS {
+					// TODO: this is a common case. The structure has an additional field that's not yet in the schema. Need to handle this cleanly.
+					tw.log.LogAttrs(ctx, slog.LevelError, "BQ table schema is missing fields", slog.Any("error", err))
+				}
 			}
+			tw.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
 		}
-		tw.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
-	}
 
-	rowErrors := full.GetRowErrors()
-	for _, re := range rowErrors {
-		tw.log.LogAttrs(ctx, slog.LevelError, "row error",
-			slog.Int64("index", re.Index),
-			slog.String("code", re.Code.String()),
-			slog.String("message", re.Message))
-	}
+		rowErrors := full.GetRowErrors()
+		for _, re := range rowErrors {
+			tw.log.LogAttrs(ctx, slog.LevelError, "row error",
+				slog.Int64("index", re.Index),
+				slog.String("code", re.Code.String()),
+				slog.String("message", re.Message))
+		}
 
-	if err == nil && len(rowErrors) > 0 {
-		err = fmt.Errorf("row errors")
-	}
+		if err == nil && len(rowErrors) > 0 {
+			err = fmt.Errorf("row errors")
+		}
 
-	b.f(b, err)
+		pr.b.f(pr.b, err)
+	}
 }

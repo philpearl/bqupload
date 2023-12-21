@@ -72,7 +72,9 @@ func (b *descriptorBuilder) handleFieldType(elt *plenccodec.Descriptor, f *descr
 
 		// Most slices must be noted as packed encoding
 		dtyp = descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
-		b.handleFieldType(&elt.Elements[0], f)
+		if err := b.handleFieldType(&elt.Elements[0], f); err != nil {
+			return fmt.Errorf("handling slice element: %w", err)
+		}
 
 		// Repeated fields can't have default values
 		f.DefaultValue = nil
@@ -122,5 +124,6 @@ func (b *descriptorBuilder) buildNestedStruct(pd *plenccodec.Descriptor) error {
 	var nested descriptorpb.DescriptorProto
 	nested.Name = proto.String(pd.TypeName)
 	b.root.NestedType = append(b.root.NestedType, &nested)
+
 	return b.handleStruct(pd, &nested)
 }

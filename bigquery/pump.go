@@ -36,6 +36,7 @@ func newPump(tw, dw chan<- uploadBuffer, completionFunc uploadCompletionFunc) *p
 		completionFunc: completionFunc,
 	}
 	p.currentBuffer.regenerate()
+	p.currentBuffer.f = p.completionFunc
 	return p
 }
 

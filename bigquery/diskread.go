@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,14 +183,19 @@ type tableDiskReader struct {
 }
 
 func newTableDiskReader(tableDir string, log *slog.Logger) (*tableDiskReader, error) {
-	var desc protocol.ConnectionDescriptor
 	data, err := os.ReadFile(filepath.Join(tableDir, "descriptor"))
 	if err != nil {
 		return nil, fmt.Errorf("reading descriptor: %w", err)
 	}
-	if err := plenc.Unmarshal(data, &desc); err != nil {
+	var desc protocol.ConnectionDescriptor
+	if err := plenc.Unmarshal(data, &desc.Descriptor); err != nil {
 		return nil, fmt.Errorf("unmarshalling descriptor: %w", err)
 	}
+
+	parts := strings.Split(tableDir, string(os.PathSeparator))
+	desc.TableName = parts[len(parts)-2]
+	desc.DataSetID = parts[len(parts)-3]
+	desc.ProjectID = parts[len(parts)-4]
 
 	return &tableDiskReader{
 		tableDir: tableDir,

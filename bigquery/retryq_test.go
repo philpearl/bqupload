@@ -96,3 +96,31 @@ func TestRetryQ(t *testing.T) {
 		})
 	}
 }
+
+func TestRetryQStopCausesDrain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tw := make(chan uploadBuffer)
+	dw := make(chan uploadBuffer, 10)
+
+	rq := newRetryQueue(tw, dw)
+	rq.start(ctx)
+
+	aerr := errors.New("aerr")
+
+	var u uploadBuffer
+	u.regenerate()
+	u.add(u.next(10))
+	rq.completionFunc(u, aerr)
+
+	if len(dw) != 0 {
+		t.Errorf("test expects data to be queued at this point, but it is not")
+	}
+
+	rq.stop()
+
+	if len(dw) != 1 {
+		t.Fatalf("expected len(dw) to be 1, got %d", len(dw))
+	}
+}

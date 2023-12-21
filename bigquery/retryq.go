@@ -68,6 +68,7 @@ func (p *retryQueue) completionFunc(u uploadBuffer, err error) {
 	p.mu.Unlock()
 
 	// This can block so we don't want to hold the lock at this point
+	u.f = p.completionFunc
 	p.dw <- u
 }
 
@@ -81,6 +82,7 @@ func (p *retryQueue) retryLoop(ctx context.Context) {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			if p.retryBuffer.len > 0 {
+				p.retryBuffer.f = p.completionFunc
 				p.dw <- p.retryBuffer
 			}
 			return

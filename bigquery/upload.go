@@ -22,6 +22,9 @@ type Uploader interface {
 	Add(buf []byte)
 
 	Flush()
+
+	// TryFlush attempts to flush the buffer to the table writer. It will not spill to disk.
+	TryFlush()
 }
 
 type UploaderFactory func(ctx context.Context, desc *protocol.ConnectionDescriptor) (Uploader, error)

@@ -8,10 +8,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
-// - [x] Descriptor may need to indicate if zero values are omitted
 // - [ ] Descriptor should perhaps use named nested struct definitions
-// - [x] Need to make sure type names are OK
-// - [x] I think we need to specify zero defaults?
 
 type descriptorBuilder struct {
 	root descriptorpb.DescriptorProto

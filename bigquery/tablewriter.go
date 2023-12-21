@@ -73,7 +73,8 @@ func (tw *tableWriter) stop() {
 	if tw.cancel != nil {
 		tw.cancel()
 	}
-	// TODO: not great because it doesn't drain the channels? Does that matter since they're unbuffered?
+	// inbound channels are unbuffered, so it doesn't matter that we don't drain
+	// them.
 	tw.wg.Wait()
 }
 

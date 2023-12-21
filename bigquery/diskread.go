@@ -19,16 +19,8 @@ import (
 
 /*
 TODO:
-- [x] make creating the data on disk atomic
-- [x] create the disk readers for each table.
-- [x] create the disk reader manager
-- [X] handle sleeping for the disk reader
-- [x] plumb everything together
-- [x] directory should be a hash of the descriptor
 - [ ] clean up empty directories
 - [ ] clean up partial writes on start-up
-- [x] track inprogress uploads & upload completions
-
 */
 
 type chanForDescriptor func(context.Context, *protocol.ConnectionDescriptor) (chan<- uploadBuffer, error)

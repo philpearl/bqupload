@@ -72,7 +72,7 @@ func TestDisk(t *testing.T) {
 		result = append(result, u)
 	}
 
-	// TODO: order is random because of random uuids
+	// Random uuids mean we have to sort the results
 	if diff := cmp.Diff(
 		[]uploadBuffer{
 			{Data: [][]byte{buf[:3], buf[3:]}, buf: buf},

@@ -74,8 +74,5 @@ func run() error {
 	bq.Stop()
 
 	log.Info("shut down")
-
-	// TODO: wait for all uploads to finish or flush to disk
-
-	select {}
+	return nil
 }

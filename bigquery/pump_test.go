@@ -50,7 +50,7 @@ func TestPump(t *testing.T) {
 			msgSize:    1,
 			msgCount:   10,
 			expTWCount: 1,
-			expDWCount: 1,
+			expDWCount: 0,
 		},
 
 		{

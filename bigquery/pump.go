@@ -1,11 +1,5 @@
 package bigquery
 
-/*
-TODO:
-- [ ] flush the current buffer to disk on stop (I think this should work now?)
-- [x] delay between retries
-*/
-
 // pump is essentially a buffer manager. It manages a buffer of data to be
 // uploaded to BigQuery. It has two destinations: the table writer and the disk
 // writer. It tries to send to the table writer first, but if that would block
@@ -48,16 +42,6 @@ func (p *pump) BufferFor(size int) []byte {
 		p.Flush()
 	}
 
-	// To keep data timely, if we can send to the table writer, do so. Otherwise
-	// we'll keep queuing.
-	if len(p.currentBuffer.Data) > minUploadCount {
-		select {
-		case p.tw <- p.currentBuffer:
-			p.currentBuffer.regenerate()
-		default:
-		}
-	}
-
 	return p.currentBuffer.next(size)
 }
 
@@ -85,4 +69,17 @@ func (p *pump) Flush() {
 
 	// We've sent the buffer - make a new one
 	p.currentBuffer.regenerate()
+}
+
+func (p *pump) TryFlush() {
+	if len(p.currentBuffer.Data) == 0 {
+		return
+	}
+	p.currentBuffer.f = p.completionFunc
+	select {
+	case p.tw <- p.currentBuffer:
+		// We've sent the buffer - make a new one
+		p.currentBuffer.regenerate()
+	default:
+	}
 }

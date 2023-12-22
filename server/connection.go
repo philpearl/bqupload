@@ -107,6 +107,7 @@ func (c *conn) readLength(buf []byte, u bigquery.Uploader) (uint32, error) {
 			u.TryFlush()
 			// There won't be anything queued to send until the read fully
 			// completes, so we don't need another deadline
+			c.SetReadDeadline(time.Time{})
 		}
 		offset += n
 	}

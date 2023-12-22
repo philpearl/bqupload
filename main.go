@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,13 +23,15 @@ func main() {
 }
 
 type opts struct {
-	baseDir string
-	addr    string
+	baseDir  string
+	addr     string
+	profiler bool
 }
 
 func (o *opts) registerFlags() {
 	flag.StringVar(&o.baseDir, "base-dir", "", "base directory for disk storage")
 	flag.StringVar(&o.addr, "addr", ":8123", "address to listen on")
+	flag.BoolVar(&o.profiler, "profiler", false, "enable profiler")
 }
 
 func (o *opts) validate() error {
@@ -49,6 +53,15 @@ func run() error {
 	flag.Parse()
 	if err := o.validate(); err != nil {
 		return fmt.Errorf("validating options: %w", err)
+	}
+
+	if o.profiler {
+		go func() {
+			// We just need a http server serving the default mux to get a pprof server
+			if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+				log.LogAttrs(ctx, slog.LevelError, "profiler server exited", slog.Any("error", err))
+			}
+		}()
 	}
 
 	cli, err := managedwriter.NewClient(ctx, "")

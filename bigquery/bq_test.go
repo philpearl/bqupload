@@ -99,7 +99,10 @@ func TestCanWrite(t *testing.T) {
 
 	dir := t.TempDir()
 
-	bq := New(cli, log, noop.Meter{}, dir)
+	bq, err := New(cli, log, noop.Meter{}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	rows := []Row{
 		{

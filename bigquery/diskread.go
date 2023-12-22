@@ -15,6 +15,8 @@ import (
 
 	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/plenc"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 /*
@@ -33,16 +35,67 @@ type DiskReadManager struct {
 	cancel            context.CancelFunc
 	wg                sync.WaitGroup
 
+	metrics diskReaderMetrics
+
 	diskReaders map[writerKey]*tableDiskReader
 }
 
-func NewDiskReadManager(baseDir string, log *slog.Logger, chanForDescriptor chanForDescriptor) *DiskReadManager {
-	return &DiskReadManager{
+func NewDiskReadManager(baseDir string, log *slog.Logger, meter metric.Meter, chanForDescriptor chanForDescriptor) (*DiskReadManager, error) {
+	drm := &DiskReadManager{
 		baseDir:           baseDir,
 		log:               log,
 		chanForDescriptor: chanForDescriptor,
 		diskReaders:       make(map[writerKey]*tableDiskReader),
 	}
+
+	if err := drm.metrics.init(meter); err != nil {
+		return nil, fmt.Errorf("initialising disk reader metrics: %w", err)
+	}
+
+	return drm, nil
+}
+
+type diskReaderMetrics struct {
+	managerScans   metric.Int64Counter
+	readerScans    metric.Int64Counter
+	numDiskReaders metric.Int64UpDownCounter
+	msgsRead       metric.Int64Counter
+	bytesRead      metric.Int64Counter
+}
+
+func (m *diskReaderMetrics) init(meter metric.Meter) (err error) {
+	m.managerScans, err = meter.Int64Counter("bqupload.diskread.manager.scans",
+		metric.WithDescription("number of scans of the disk read manager"),
+		metric.WithUnit("{scan}"))
+	if err != nil {
+		return fmt.Errorf("creating manager scans counter: %w", err)
+	}
+	m.readerScans, err = meter.Int64Counter("bqupload.diskread.reader.scans",
+		metric.WithDescription("number of scans of the disk readers"),
+		metric.WithUnit("{scan}"))
+	if err != nil {
+		return fmt.Errorf("creating reader scans counter: %w", err)
+	}
+	m.numDiskReaders, err = meter.Int64UpDownCounter("bqupload.diskread.num_disk_readers",
+		metric.WithDescription("number of disk readers"),
+		metric.WithUnit("{count}"))
+	if err != nil {
+		return fmt.Errorf("creating num_disk_readers gauge: %w", err)
+	}
+	m.msgsRead, err = meter.Int64Counter("bqupload.diskread.msgs_read",
+		metric.WithDescription("number of msgs read from disk"),
+		metric.WithUnit("{msg}"))
+	if err != nil {
+		return fmt.Errorf("creating msgs_read counter: %w", err)
+	}
+	m.bytesRead, err = meter.Int64Counter("bqupload.diskread.bytes_read",
+		metric.WithDescription("number of bytes read from disk"),
+		metric.WithUnit("{byte}"))
+	if err != nil {
+		return fmt.Errorf("creating bytes_read counter: %w", err)
+	}
+
+	return nil
 }
 
 func (drm *DiskReadManager) Start(ctx context.Context) {
@@ -66,6 +119,7 @@ func (drm *DiskReadManager) loop(ctx context.Context) {
 	tick := time.NewTicker(5 * time.Second)
 	for {
 		drm.scan(ctx)
+		drm.metrics.managerScans.Add(ctx, 1)
 
 		select {
 		case <-ctx.Done():
@@ -134,7 +188,7 @@ func (drm *DiskReadManager) scanTable(ctx context.Context, projectID, dataSetID,
 		key := writerKey{ProjectID: projectID, DataSetID: dataSetID, TableName: tableName, Hash: hash}
 		if _, ok := drm.diskReaders[key]; !ok {
 
-			tdr, err := newTableDiskReader(filepath.Join(tableDir, hash), drm.log)
+			tdr, err := newTableDiskReader(filepath.Join(tableDir, hash), drm.log, drm.metrics)
 			if err != nil {
 				if !errors.Is(err, fs.ErrNotExist) {
 					drm.log.LogAttrs(ctx, slog.LevelError, "creating table disk reader", slog.Any("error", err), slog.String("project", projectID), slog.String("dataset", dataSetID))
@@ -172,9 +226,12 @@ type tableDiskReader struct {
 	// we want to delete the files before they're done.
 	mu       sync.Mutex
 	inflight map[string]struct{}
+
+	metrics   diskReaderMetrics
+	tableInfo attribute.Set
 }
 
-func newTableDiskReader(tableDir string, log *slog.Logger) (*tableDiskReader, error) {
+func newTableDiskReader(tableDir string, log *slog.Logger, dmetrics diskReaderMetrics) (*tableDiskReader, error) {
 	data, err := os.ReadFile(filepath.Join(tableDir, "descriptor"))
 	if err != nil {
 		return nil, fmt.Errorf("reading descriptor: %w", err)
@@ -189,11 +246,15 @@ func newTableDiskReader(tableDir string, log *slog.Logger) (*tableDiskReader, er
 	desc.DataSetID = parts[len(parts)-3]
 	desc.ProjectID = parts[len(parts)-4]
 
+	tableInfo := attribute.NewSet(attribute.String("project", desc.ProjectID), attribute.String("dataset", desc.DataSetID), attribute.String("table", desc.TableName))
+
 	return &tableDiskReader{
-		tableDir: tableDir,
-		log:      log,
-		desc:     &desc,
-		inflight: make(map[string]struct{}),
+		tableDir:  tableDir,
+		log:       log,
+		desc:      &desc,
+		inflight:  make(map[string]struct{}),
+		metrics:   dmetrics,
+		tableInfo: tableInfo,
 	}, nil
 }
 
@@ -213,6 +274,8 @@ func (tdr *tableDiskReader) Stop() {
 }
 
 func (tdr *tableDiskReader) loop(ctx context.Context) {
+	tdr.metrics.numDiskReaders.Add(context.Background(), 1, metric.WithAttributeSet(tdr.tableInfo))
+	defer tdr.metrics.numDiskReaders.Add(context.Background(), -1, metric.WithAttributeSet(tdr.tableInfo))
 	defer tdr.wg.Done()
 
 	for {
@@ -237,6 +300,8 @@ func (tdr *tableDiskReader) loop(ctx context.Context) {
 				return
 			}
 		}
+
+		tdr.metrics.readerScans.Add(ctx, 1, metric.WithAttributeSet(tdr.tableInfo))
 
 		// Now sleep for a bit before we try again.
 		timer := time.NewTimer(5 * time.Second)
@@ -275,6 +340,7 @@ func (tdr *tableDiskReader) processFile(ctx context.Context, id string) error {
 
 	u := uploadBuffer{
 		buf:  dbuf,
+		len:  len(dbuf),
 		Data: make([][]byte, l),
 		f:    func(u uploadBuffer, err error) { tdr.uploadComplete(u, id, err) },
 	}
@@ -292,10 +358,13 @@ func (tdr *tableDiskReader) processFile(ctx context.Context, id string) error {
 	select {
 	case tdr.out <- u:
 	case <-ctx.Done():
-		// system is shutting down - don't wait to send this file. We'll keep it
-		// for when we restart.
+		// system is shutting down - don't wait to send this file.
+		// uploadComplete won't run so we'll keep the file for resending
 		return nil
 	}
+
+	tdr.metrics.bytesRead.Add(ctx, int64(u.len), metric.WithAttributeSet(tdr.tableInfo))
+	tdr.metrics.msgsRead.Add(ctx, int64(len(u.Data)), metric.WithAttributeSet(tdr.tableInfo))
 
 	return nil
 }

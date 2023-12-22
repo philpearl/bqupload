@@ -14,6 +14,8 @@ import (
 	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/plenc"
 	"github.com/philpearl/plenc/plenccodec"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 func TestDisk(t *testing.T) {
@@ -45,19 +47,27 @@ func TestDisk(t *testing.T) {
 
 	ch := make(chan uploadBuffer)
 
-	drm := NewDiskReadManager(dir, log, func(ctx context.Context, cd *protocol.ConnectionDescriptor) (chan<- uploadBuffer, error) {
+	drm, err := NewDiskReadManager(dir, log, noop.Meter{}, func(ctx context.Context, cd *protocol.ConnectionDescriptor) (chan<- uploadBuffer, error) {
 		return ch, nil
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	drm.Start(ctx)
 
 	hashb := sha256.Sum256(encodedDesc)
 	hash := hex.EncodeToString(hashb[:])
 
-	dw, err := newDiskWriter(filepath.Join(dir, desc.ProjectID, desc.DataSetID, desc.TableName, hash), log, encodedDesc)
+	var dwm diskWriteMetrics
+	if err := dwm.init(noop.Meter{}); err != nil {
+		t.Fatal(err)
+	}
+
+	dw, err := newDiskWriter(filepath.Join(dir, desc.ProjectID, desc.DataSetID, desc.TableName, hash), log, dwm, *attribute.EmptySet(), encodedDesc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dw.start()
+	dw.start(ctx)
 
 	// write some data to the disk writer
 	buf := []byte{1, 2, 3, 4, 5, 6, 7, 8}

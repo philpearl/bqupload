@@ -12,6 +12,8 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/plenc"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type writerKey struct {
@@ -29,7 +31,7 @@ type uploadGroup struct {
 
 func (u *uploadGroup) start(ctx context.Context) {
 	u.tw.start(ctx)
-	u.dw.start()
+	u.dw.start(ctx)
 	u.rq.start(ctx)
 }
 
@@ -49,15 +51,86 @@ type bq struct {
 
 	mu        sync.Mutex
 	uploaders map[writerKey]uploadGroup
+
+	dwm diskWriteMetrics
+	twm tableWriteMetrics
 }
 
-func New(client *managedwriter.Client, log *slog.Logger, baseDir string) *bq {
-	return &bq{
+func New(client *managedwriter.Client, log *slog.Logger, meter metric.Meter, baseDir string) (*bq, error) {
+	bq := &bq{
 		client:    client,
 		log:       log,
 		baseDir:   baseDir,
 		uploaders: make(map[writerKey]uploadGroup),
 	}
+
+	if err := bq.dwm.init(meter); err != nil {
+		return nil, fmt.Errorf("initialising disk write metrics: %w", err)
+	}
+
+	if err := bq.twm.init(meter); err != nil {
+		return nil, fmt.Errorf("initialising table write metrics: %w", err)
+	}
+
+	return bq, nil
+}
+
+type diskWriteMetrics struct {
+	bytesWritten metric.Int64Counter
+	msgsWritten  metric.Int64Counter
+	writes       metric.Int64Counter
+}
+
+func (dwm *diskWriteMetrics) init(meter metric.Meter) error {
+	var err error
+	dwm.bytesWritten, err = meter.Int64Counter("bqupload.disk_write.bytes",
+		metric.WithDescription("number of bytes written to disk"),
+		metric.WithUnit("{byte}"))
+	if err != nil {
+		return fmt.Errorf("creating bytes_written counter: %w", err)
+	}
+	dwm.msgsWritten, err = meter.Int64Counter("bqupload.disk_write.msgs",
+		metric.WithDescription("number of messages written to disk"),
+		metric.WithUnit("{msg}"))
+	if err != nil {
+		return fmt.Errorf("creating msgs_written counter: %w", err)
+	}
+	dwm.writes, err = meter.Int64Counter("bqupload.disk_write.writes",
+		metric.WithDescription("number of writes to disk"),
+		metric.WithUnit("{count}"))
+	if err != nil {
+		return fmt.Errorf("creating writes counter: %w", err)
+	}
+	return nil
+}
+
+type tableWriteMetrics struct {
+	appends      metric.Int64Counter
+	rowsAppended metric.Int64Counter
+	errors       metric.Int64Counter
+}
+
+func (twm *tableWriteMetrics) init(meter metric.Meter) error {
+	var err error
+	twm.appends, err = meter.Int64Counter("bqupload.table_write.appends",
+		metric.WithDescription("number of appends to table"),
+		metric.WithUnit("{count}"))
+	if err != nil {
+		return fmt.Errorf("creating appends counter: %w", err)
+	}
+	twm.rowsAppended, err = meter.Int64Counter("bqupload.table_write.rows_appended",
+		metric.WithDescription("number of rows appended to table"),
+		metric.WithUnit("{row}"))
+	if err != nil {
+		return fmt.Errorf("creating rows_appended counter: %w", err)
+	}
+	twm.errors, err = meter.Int64Counter("bqupload.table_write.errors",
+		metric.WithDescription("number of errors from table"),
+		metric.WithUnit("{count}"))
+	if err != nil {
+		return fmt.Errorf("creating errors counter: %w", err)
+	}
+	return nil
 }
 
 func (bq *bq) Wait() {
@@ -109,6 +182,8 @@ func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescr
 	hash := sha256.Sum256(data)
 	key := writerKey{ProjectID: desc.ProjectID, DataSetID: desc.DataSetID, TableName: desc.TableName, Hash: hex.EncodeToString(hash[:])}
 
+	attr := attribute.NewSet(attribute.String("project", key.ProjectID), attribute.String("dataset", key.DataSetID), attribute.String("table", key.TableName), attribute.String("hash", key.Hash))
+
 	bq.mu.Lock()
 	defer bq.mu.Unlock()
 
@@ -117,13 +192,13 @@ func (bq *bq) getUploadGroup(ctx context.Context, desc *protocol.ConnectionDescr
 	}
 
 	// We don't have an existing writer, so we create a new set here.
-	tw, err := newTableWriter(ctx, bq.client, desc, bq.log)
+	tw, err := newTableWriter(ctx, bq.client, desc, bq.log, bq.twm, attr)
 	if err != nil {
 		return uploadGroup{}, fmt.Errorf("creating table writer: %w", err)
 	}
 
 	dir := filepath.Join(bq.baseDir, key.ProjectID, key.DataSetID, key.TableName, key.Hash)
-	dw, err := newDiskWriter(dir, bq.log, data)
+	dw, err := newDiskWriter(dir, bq.log, bq.dwm, attr, data)
 	if err != nil {
 		return uploadGroup{}, fmt.Errorf("creating disk writer: %w", err)
 	}

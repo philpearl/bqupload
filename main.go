@@ -14,7 +14,13 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/philpearl/bqupload/bigquery"
 	"github.com/philpearl/bqupload/server"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	api "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/metric"
 )
+
+const meterName = "github.com/phipearl/bqupload"
 
 func main() {
 	if err := run(); err != nil {
@@ -64,21 +70,41 @@ func run() error {
 		}()
 	}
 
+	exporter, err := prometheus.New()
+	if err != nil {
+		return fmt.Errorf("creating prometheus exporter: %w", err)
+	}
+	// TODO: use metric.WithResource to associate some attributes with all metrics.
+	provider := metric.NewMeterProvider(metric.WithReader(exporter))
+	meter := provider.Meter(meterName)
+
+	// Start the prometheus HTTP server and pass the exporter Collector to it
+	go serveMetrics(log, meter, exporter)
+
 	cli, err := managedwriter.NewClient(ctx, "")
 	if err != nil {
 		return fmt.Errorf("creating bigquery client: %w", err)
 	}
 
-	bq := bigquery.New(cli, log, o.baseDir)
-	drm := bigquery.NewDiskReadManager(o.baseDir, log, bq.GetChanForDescriptor)
+	bq, err := bigquery.New(cli, log, meter, o.baseDir)
+	if err != nil {
+		return fmt.Errorf("creating bigquery: %w", err)
+	}
+	drm, err := bigquery.NewDiskReadManager(o.baseDir, log, meter, bq.GetChanForDescriptor)
+	if err != nil {
+		return fmt.Errorf("creating disk read manager: %w", err)
+	}
 	drm.Start(ctx)
 
-	s := server.New(o.addr, log, bq.GetUploader)
+	s, err := server.New(o.addr, log, meter, bq.GetUploader)
+	if err != nil {
+		return fmt.Errorf("creating server: %w", err)
+	}
 	if err := s.Start(ctx); err != nil {
 		return fmt.Errorf("starting server: %w", err)
 	}
 
-	// block forever while the server runs.
+	// block while the server runs.
 	<-ctx.Done()
 	log.Info("shutting down")
 
@@ -88,4 +114,14 @@ func run() error {
 
 	log.Info("shut down")
 	return nil
+}
+
+func serveMetrics(log *slog.Logger, meter api.Meter, exporter *prometheus.Exporter) {
+	log.Info("serving metrics at localhost:2223/metrics")
+	http.Handle("/metrics", promhttp.Handler())
+	err := http.ListenAndServe(":2223", nil)
+	if err != nil {
+		fmt.Printf("error serving http: %v", err)
+		return
+	}
 }

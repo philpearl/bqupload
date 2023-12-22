@@ -18,6 +18,7 @@ import (
 	plencnull "github.com/philpearl/plenc/null"
 	"github.com/philpearl/plenc/plenccodec"
 	"github.com/unravelin/null"
+	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 )
@@ -98,7 +99,7 @@ func TestCanWrite(t *testing.T) {
 
 	dir := t.TempDir()
 
-	bq := New(cli, log, dir)
+	bq := New(cli, log, noop.Meter{}, dir)
 
 	rows := []Row{
 		{

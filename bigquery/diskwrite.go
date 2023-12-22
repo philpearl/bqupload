@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // diskWriter handles writing buffers to disk. One diskWriter is created per
@@ -18,16 +20,19 @@ type diskWriter struct {
 	// Where this disk writer is writing to
 	baseDir string
 	// Channel on which buffers are sent to the disk writer
-	in  chan uploadBuffer
-	wg  sync.WaitGroup
-	log *slog.Logger
+	in      chan uploadBuffer
+	wg      sync.WaitGroup
+	log     *slog.Logger
+	metrics diskWriteMetrics
+	attr    attribute.Set
 }
 
-func newDiskWriter(baseDir string, log *slog.Logger, desc []byte) (*diskWriter, error) {
+func newDiskWriter(baseDir string, log *slog.Logger, metrics diskWriteMetrics, attr attribute.Set, desc []byte) (*diskWriter, error) {
 	dw := &diskWriter{
 		baseDir: baseDir,
 		in:      make(chan uploadBuffer, 100),
 		log:     log,
+		metrics: metrics,
 	}
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		return nil, fmt.Errorf("making base directory: %w", err)
@@ -48,9 +53,9 @@ func newDiskWriter(baseDir string, log *slog.Logger, desc []byte) (*diskWriter, 
 	return dw, nil
 }
 
-func (dw *diskWriter) start() {
+func (dw *diskWriter) start(ctx context.Context) {
 	dw.wg.Add(1)
-	go dw.loop()
+	go dw.loop(ctx)
 }
 
 func (dw *diskWriter) stop() {
@@ -58,18 +63,21 @@ func (dw *diskWriter) stop() {
 	dw.wg.Wait()
 }
 
-func (dw *diskWriter) loop() {
+func (dw *diskWriter) loop(ctx context.Context) {
 	defer dw.wg.Done()
 	for buf := range dw.in {
+		dw.metrics.writes.Add(ctx, 1, metric.WithAttributeSet(dw.attr))
 		// Note we don't call the completion function on the buffer here. If we
 		// can't write to disk we'll lose data. Them's the breaks.
-		if err := dw.writeBufferToDisk(buf); err != nil {
-			dw.log.LogAttrs(context.Background(), slog.LevelError, "writing buffer to disk", slog.Any("error", err))
+		if err := dw.writeBufferToDisk(ctx, buf); err != nil {
+			dw.log.LogAttrs(ctx, slog.LevelError, "writing buffer to disk", slog.Any("error", err))
 		}
 	}
 }
 
-func (dw *diskWriter) writeBufferToDisk(buf uploadBuffer) error {
+func (dw *diskWriter) writeBufferToDisk(ctx context.Context, buf uploadBuffer) error {
+	dw.log.LogAttrs(ctx, slog.LevelInfo, "writing buffer to disk", slog.Int("buffer", buf.len))
+
 	uploadID := uuid.NewString()
 	bufDir := filepath.Join(dw.baseDir, uploadID)
 	if err := os.MkdirAll(bufDir, 0o755); err != nil {
@@ -94,5 +102,9 @@ func (dw *diskWriter) writeBufferToDisk(buf uploadBuffer) error {
 	if err := os.Rename(lengthsNameNew, lengthsName); err != nil {
 		return fmt.Errorf("renaming lengths: %w", err)
 	}
+
+	dw.metrics.bytesWritten.Add(ctx, int64(buf.len), metric.WithAttributeSet(dw.attr))
+	dw.metrics.msgsWritten.Add(ctx, int64(len(buf.Data)), metric.WithAttributeSet(dw.attr))
+
 	return nil
 }

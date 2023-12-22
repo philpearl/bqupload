@@ -8,6 +8,7 @@ import (
 	"net"
 
 	"github.com/philpearl/bqupload/bigquery"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -18,11 +19,41 @@ type Server struct {
 	eg           errgroup.Group
 	makeUploader bigquery.UploaderFactory
 
+	connectionsStarted metric.Int64Counter
+	connectionsRunning metric.Int64UpDownCounter
+
+	connMetrics connMetrics
+
 	cancel context.CancelFunc
 }
 
-func New(addr string, log *slog.Logger, makeUploader bigquery.UploaderFactory) *Server {
-	return &Server{addr: addr, log: log, makeUploader: makeUploader}
+func New(addr string, log *slog.Logger, meter metric.Meter, makeUploader bigquery.UploaderFactory) (*Server, error) {
+	connectionsRunning, err := meter.Int64UpDownCounter("bqupload.server.connections_running",
+		metric.WithDescription("number of connections running"),
+		metric.WithUnit("{connection}"))
+	if err != nil {
+		return nil, fmt.Errorf("creating connections_running counter: %w", err)
+	}
+	connectionsStarted, err := meter.Int64Counter("bqupload.server.connections_started",
+		metric.WithDescription("number of connections started"),
+		metric.WithUnit("{connection}"))
+	if err != nil {
+		return nil, fmt.Errorf("creating connections_started counter: %w", err)
+	}
+
+	s := &Server{
+		addr:               addr,
+		log:                log,
+		makeUploader:       makeUploader,
+		connectionsStarted: connectionsStarted,
+		connectionsRunning: connectionsRunning,
+	}
+
+	if err := s.connMetrics.init(meter); err != nil {
+		return nil, fmt.Errorf("initialising connection metrics: %w", err)
+	}
+
+	return s, nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -66,8 +97,10 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) onNewConnection(ctx context.Context, conn *net.TCPConn) {
-	defer conn.Close()
-	c := newConn(conn, s.makeUploader)
+	c := s.newConn(conn, s.makeUploader)
+	s.connectionsStarted.Add(ctx, 1)
+	s.connectionsRunning.Add(ctx, 1)
+	defer s.connectionsRunning.Add(ctx, -1)
 	if err := c.do(ctx); err != nil {
 		s.log.LogAttrs(ctx, slog.LevelError, "connection error", slog.Any("error", err))
 	}

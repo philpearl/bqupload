@@ -10,6 +10,8 @@ import (
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/philpearl/bqupload/protocol"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // tableWriter is responsible for sending data to a single table. It pulls data
@@ -24,6 +26,9 @@ type tableWriter struct {
 	inMemory chan uploadBuffer
 	disk     chan uploadBuffer
 	results  chan partialResult
+
+	metrics tableWriteMetrics
+	attr    attribute.Set
 }
 
 type partialResult struct {
@@ -31,7 +36,7 @@ type partialResult struct {
 	res *managedwriter.AppendResult
 }
 
-func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger) (*tableWriter, error) {
+func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *protocol.ConnectionDescriptor, log *slog.Logger, metrics tableWriteMetrics, attr attribute.Set) (*tableWriter, error) {
 	// convert the descriptor to a protobuf descriptor
 	dp, err := PlencDescriptorToProtobuf(&desc.Descriptor)
 	if err != nil {
@@ -56,6 +61,8 @@ func newTableWriter(ctx context.Context, client *managedwriter.Client, desc *pro
 		inMemory: make(chan uploadBuffer),
 		disk:     make(chan uploadBuffer),
 		results:  make(chan partialResult, 10),
+		metrics:  metrics,
+		attr:     attr,
 	}, nil
 }
 
@@ -131,6 +138,9 @@ func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 		b.f(b, nil)
 		return
 	}
+
+	tw.metrics.appends.Add(ctx, 1, metric.WithAttributeSet(tw.attr))
+	tw.metrics.rowsAppended.Add(ctx, int64(len(b.Data)), metric.WithAttributeSet(tw.attr))
 	// TODO: we're just logging errors for now.
 	// Longer term we need to decide what to do. I think we either want to
 	//
@@ -145,6 +155,7 @@ func (tw *tableWriter) send(ctx context.Context, b uploadBuffer) {
 		// We really want to know whether this is a fatal error or not. If not
 		// fatal we can retry. We can just keep blocking until it works? TODO:
 		// what?
+		tw.metrics.errors.Add(ctx, 1, metric.WithAttributeSet(tw.attr))
 		tw.log.LogAttrs(ctx, slog.LevelError, "append rows", slog.Any("error", err))
 		b.f(b, err)
 		return
@@ -175,6 +186,7 @@ func (tw *tableWriter) resultLoop(ctx context.Context) {
 				}
 			}
 			tw.log.LogAttrs(ctx, slog.LevelError, "append rows full response", slog.Any("error", err))
+			tw.metrics.errors.Add(ctx, 1, metric.WithAttributeSet(tw.attr))
 		}
 
 		rowErrors := full.GetRowErrors()
@@ -187,6 +199,7 @@ func (tw *tableWriter) resultLoop(ctx context.Context) {
 
 		if err == nil && len(rowErrors) > 0 {
 			err = fmt.Errorf("row errors")
+			tw.metrics.errors.Add(ctx, 1, metric.WithAttributeSet(tw.attr))
 		}
 
 		pr.b.f(pr.b, err)

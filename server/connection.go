@@ -13,15 +13,39 @@ import (
 	"github.com/philpearl/bqupload/bigquery"
 	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/plenc"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type conn struct {
 	*net.TCPConn
 	getUploader bigquery.UploaderFactory
+	connMetrics connMetrics
 }
 
-func newConn(c *net.TCPConn, makeUploader bigquery.UploaderFactory) conn {
-	return conn{TCPConn: c, getUploader: makeUploader}
+type connMetrics struct {
+	bytesReceived metric.Int64Counter
+	msgsReceived  metric.Int64Counter
+}
+
+func (cm *connMetrics) init(meter metric.Meter) (err error) {
+	cm.bytesReceived, err = meter.Int64Counter("bqupload.server.connection.bytes",
+		metric.WithDescription("number of bytes received"),
+		metric.WithUnit("{byte}"))
+	if err != nil {
+		return fmt.Errorf("creating bytes counter: %w", err)
+	}
+	cm.msgsReceived, err = meter.Int64Counter("bqupload.server.connection.msgs",
+		metric.WithDescription("number of msgs received"),
+		metric.WithUnit("{msg}"))
+	if err != nil {
+		return fmt.Errorf("creating msgs counter: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Server) newConn(c *net.TCPConn, makeUploader bigquery.UploaderFactory) conn {
+	return conn{TCPConn: c, getUploader: makeUploader, connMetrics: s.connMetrics}
 }
 
 func (c *conn) do(ctx context.Context) error {
@@ -77,6 +101,8 @@ func (c *conn) do(ctx context.Context) error {
 			return fmt.Errorf("reading message: %w", err)
 		}
 		u.Add(data)
+		c.connMetrics.bytesReceived.Add(ctx, int64(length))
+		c.connMetrics.msgsReceived.Add(ctx, 1)
 
 		// Acknowledge the message. We'll just send the message number since we
 		// always process them in order. The sender can just wait until the

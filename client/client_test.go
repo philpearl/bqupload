@@ -13,6 +13,7 @@ import (
 	"github.com/philpearl/bqupload/protocol"
 	"github.com/philpearl/bqupload/server"
 	"github.com/philpearl/plenc"
+	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -63,7 +64,10 @@ func TestClient(t *testing.T) {
 		return &fu, err
 	}
 
-	s := server.New("localhost:0", log, factory)
+	s, err := server.New("localhost:0", log, noop.Meter{}, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx := context.Background()
 
